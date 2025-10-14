@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/storage",
+    "crates/twitch",
+    "crates/util",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tower = { version = "0.4.13", features = ["util"] }
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
