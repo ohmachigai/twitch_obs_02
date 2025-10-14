@@ -1,0 +1,7 @@
+[package]
+name = "twi-overlay-util"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dotenvy = { workspace = true }
