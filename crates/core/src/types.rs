@@ -1,0 +1,353 @@
+use std::fmt;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+/// Application settings persisted for a broadcaster.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default = "default_overlay_theme")]
+    pub overlay_theme: String,
+    #[serde(default = "default_group_size")]
+    pub group_size: u32,
+    #[serde(default)]
+    pub clear_on_stream_start: bool,
+    #[serde(default)]
+    pub clear_decrement_counts: bool,
+    #[serde(default)]
+    pub policy: PolicySettings,
+}
+
+fn default_overlay_theme() -> String {
+    "default".to_string()
+}
+
+fn default_group_size() -> u32 {
+    1
+}
+
+/// Policy specific settings that control the queue behaviour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicySettings {
+    #[serde(default = "PolicySettings::default_window_sec")]
+    pub anti_spam_window_sec: u64,
+    #[serde(default)]
+    pub duplicate_policy: DuplicatePolicy,
+    #[serde(default)]
+    pub target_rewards: Vec<String>,
+}
+
+impl PolicySettings {
+    fn default_window_sec() -> u64 {
+        60
+    }
+
+    /// Returns `true` when the provided reward identifier is enabled for policy evaluation.
+    pub fn is_reward_enabled(&self, reward_id: &str) -> bool {
+        self.target_rewards.iter().any(|value| value == reward_id)
+    }
+}
+
+impl Default for PolicySettings {
+    fn default() -> Self {
+        Self {
+            anti_spam_window_sec: Self::default_window_sec(),
+            duplicate_policy: DuplicatePolicy::default(),
+            target_rewards: Vec::new(),
+        }
+    }
+}
+
+/// Behaviour when a duplicate redemption is detected inside the spam window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicatePolicy {
+    Consume,
+    Refund,
+}
+
+impl Default for DuplicatePolicy {
+    fn default() -> Self {
+        Self::Consume
+    }
+}
+
+impl Settings {
+    /// Returns the policy configuration.
+    pub fn policy(&self) -> &PolicySettings {
+        &self.policy
+    }
+}
+
+/// Deterministic representation of EventSub payloads used by the domain layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NormalizedEvent {
+    #[serde(rename_all = "snake_case")]
+    RedemptionAdd {
+        broadcaster_id: String,
+        occurred_at: DateTime<Utc>,
+        redemption_id: String,
+        user: NormalizedUser,
+        reward: NormalizedReward,
+    },
+    #[serde(rename_all = "snake_case")]
+    RedemptionUpdate {
+        broadcaster_id: String,
+        occurred_at: DateTime<Utc>,
+        redemption_id: String,
+        status: NormalizedRedemptionStatus,
+        user: NormalizedUser,
+        reward: NormalizedReward,
+    },
+    #[serde(rename_all = "snake_case")]
+    StreamOnline {
+        broadcaster_id: String,
+        occurred_at: DateTime<Utc>,
+    },
+    #[serde(rename_all = "snake_case")]
+    StreamOffline {
+        broadcaster_id: String,
+        occurred_at: DateTime<Utc>,
+    },
+}
+
+impl NormalizedEvent {
+    /// Returns the broadcaster associated with the event.
+    pub fn broadcaster_id(&self) -> &str {
+        match self {
+            Self::RedemptionAdd { broadcaster_id, .. }
+            | Self::RedemptionUpdate { broadcaster_id, .. }
+            | Self::StreamOnline { broadcaster_id, .. }
+            | Self::StreamOffline { broadcaster_id, .. } => broadcaster_id,
+        }
+    }
+
+    /// Returns the canonical event type string used across telemetry.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::RedemptionAdd { .. } => "redemption.add",
+            Self::RedemptionUpdate { .. } => "redemption.update",
+            Self::StreamOnline { .. } => "stream.online",
+            Self::StreamOffline { .. } => "stream.offline",
+        }
+    }
+
+    /// Returns the occurrence timestamp of the event.
+    pub fn occurred_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::RedemptionAdd { occurred_at, .. }
+            | Self::RedemptionUpdate { occurred_at, .. }
+            | Self::StreamOnline { occurred_at, .. }
+            | Self::StreamOffline { occurred_at, .. } => *occurred_at,
+        }
+    }
+
+    /// Produces a redacted JSON representation suitable for Tap output.
+    pub fn redacted(&self) -> Value {
+        match self {
+            Self::RedemptionAdd {
+                broadcaster_id,
+                occurred_at,
+                redemption_id,
+                user,
+                reward,
+            } => json!({
+                "type": self.event_type(),
+                "broadcaster_id": broadcaster_id,
+                "occurred_at": occurred_at,
+                "redemption_id": redemption_id,
+                "user": user.redacted(),
+                "reward": reward,
+            }),
+            Self::RedemptionUpdate {
+                broadcaster_id,
+                occurred_at,
+                redemption_id,
+                status,
+                user,
+                reward,
+            } => json!({
+                "type": self.event_type(),
+                "broadcaster_id": broadcaster_id,
+                "occurred_at": occurred_at,
+                "redemption_id": redemption_id,
+                "status": status,
+                "user": user.redacted(),
+                "reward": reward,
+            }),
+            Self::StreamOnline {
+                broadcaster_id,
+                occurred_at,
+            }
+            | Self::StreamOffline {
+                broadcaster_id,
+                occurred_at,
+            } => json!({
+                "type": self.event_type(),
+                "broadcaster_id": broadcaster_id,
+                "occurred_at": occurred_at,
+            }),
+        }
+    }
+}
+
+/// Twitch redemption user information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedUser {
+    pub id: String,
+    pub login: Option<String>,
+    pub display_name: Option<String>,
+}
+
+impl NormalizedUser {
+    /// Redacts potentially sensitive user facing identifiers.
+    pub fn redacted(&self) -> Value {
+        json!({
+            "id": self.id,
+            "login": self.login.as_ref().map(|_| "***"),
+            "display_name": self.display_name.as_ref().map(|_| "***"),
+        })
+    }
+}
+
+/// Twitch reward metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedReward {
+    pub id: String,
+    pub title: Option<String>,
+    pub cost: Option<u64>,
+}
+
+/// Redemption status values emitted by Twitch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizedRedemptionStatus {
+    Pending,
+    Fulfilled,
+    Canceled,
+    Unknown(String),
+}
+
+impl fmt::Display for NormalizedRedemptionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Fulfilled => write!(f, "fulfilled"),
+            Self::Canceled => write!(f, "canceled"),
+            Self::Unknown(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+/// Commands generated by the policy engine.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Command {
+    Enqueue(EnqueueCommand),
+    RedemptionUpdate(RedemptionUpdateCommand),
+}
+
+impl Command {
+    /// Returns the metrics label associated with the command.
+    pub fn metric_kind(&self) -> &'static str {
+        match self {
+            Self::Enqueue(_) => "enqueue",
+            Self::RedemptionUpdate(command) => match command.mode {
+                RedemptionUpdateMode::Consume => "consume",
+                RedemptionUpdateMode::Refund => "refund",
+            },
+        }
+    }
+
+    /// Returns a redacted JSON representation of the command.
+    pub fn redacted(&self) -> Value {
+        match self {
+            Self::Enqueue(command) => command.redacted(),
+            Self::RedemptionUpdate(command) => command.redacted(),
+        }
+    }
+}
+
+/// Source of a generated command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSource {
+    Policy,
+    Admin,
+}
+
+/// Queue enqueue command emitted by the policy stage.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EnqueueCommand {
+    pub broadcaster_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub source: CommandSource,
+    pub user: NormalizedUser,
+    pub reward: NormalizedReward,
+    pub redemption_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
+}
+
+impl EnqueueCommand {
+    fn redacted(&self) -> Value {
+        json!({
+            "type": "enqueue",
+            "broadcaster_id": self.broadcaster_id,
+            "issued_at": self.issued_at,
+            "source": "policy",
+            "user": self.user.redacted(),
+            "reward": self.reward,
+            "redemption_id": self.redemption_id,
+        })
+    }
+}
+
+/// Helix redemption update command (dry-run for now).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RedemptionUpdateCommand {
+    pub broadcaster_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub source: CommandSource,
+    pub redemption_id: String,
+    pub mode: RedemptionUpdateMode,
+    pub applicable: bool,
+    pub result: CommandResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl RedemptionUpdateCommand {
+    fn redacted(&self) -> Value {
+        json!({
+            "type": "redemption.update",
+            "broadcaster_id": self.broadcaster_id,
+            "issued_at": self.issued_at,
+            "source": "policy",
+            "redemption_id": self.redemption_id,
+            "mode": self.mode,
+            "applicable": self.applicable,
+            "result": self.result,
+            "error": self.error,
+        })
+    }
+}
+
+/// Mode of the Helix redemption update command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedemptionUpdateMode {
+    Refund,
+    Consume,
+}
+
+/// Result of attempting to execute a command. Currently a placeholder until Helix integration lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandResult {
+    Ok,
+    Failed,
+    Skipped,
+}

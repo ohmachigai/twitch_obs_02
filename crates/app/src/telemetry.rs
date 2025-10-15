@@ -134,6 +134,10 @@ pub fn init_metrics() -> Result<PrometheusHandle, TelemetryError> {
         "webhook_ack_latency_seconds",
         "Latency in seconds to acknowledge EventSub webhook requests"
     );
+    describe_counter!(
+        "policy_commands_total",
+        "Count of commands emitted by the policy engine labelled by kind"
+    );
     START_TIME.get_or_init(Instant::now);
 
     Ok(handle)

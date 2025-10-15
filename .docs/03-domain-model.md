@@ -331,6 +331,10 @@ NormalizedEvent =
 
 * **定義**：同一 `user_id` が同一 `reward_id` を**`anti_spam_window_sec` 秒内**に 2 回以上引き換えた場合、2 回目以降は `consume` 優先。
 * **判定データ**：`EventRaw` または `QueueEntry` の `enqueued_at` を参照。
+* **ポリシー出力**：
+  * 対象リワード (`policy.target_rewards`) 以外は **無視**（Command 生成なし）。
+  * 初回は `enqueue` ＋ `redemption.update(mode="consume", result="skipped")` を発行（Helix 連携前のダミー結果）。
+  * 反スパムに該当する重複は **キューへ積まず**、`redemption.update(mode=duplicate_policy)` のみ出力。
 * **可否**：`duplicate_policy` が `"refund"` の場合は返金を優先。
 
 > Helix 更新は **自アプリ作成リワード** のみ適用可。それ以外は `applicable=false` で `skipped` とする。

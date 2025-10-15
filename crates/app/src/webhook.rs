@@ -14,7 +14,9 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
-use twi_overlay_storage::{EventRawError, EventRawInsertOutcome, NewEventRaw};
+use twi_overlay_core::normalizer::{Normalizer, NormalizerError};
+use twi_overlay_core::types::{NormalizedEvent, Settings};
+use twi_overlay_storage::{EventRawError, EventRawInsertOutcome, NewEventRaw, SettingsError};
 use uuid::Uuid;
 
 use crate::router::AppState;
@@ -285,10 +287,300 @@ async fn handle_persisted_message(
         status: StatusCode::NO_CONTENT,
     });
 
+    if !duplicate {
+        process_pipeline(
+            state,
+            json_value,
+            body_string.len() as u64,
+            event_type,
+            broadcaster_id,
+            message_id,
+        )
+        .await;
+    }
+
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(axum::body::Body::empty())
         .unwrap())
+}
+
+async fn process_pipeline(
+    state: &AppState,
+    json_value: &Value,
+    body_len: u64,
+    event_type: &str,
+    broadcaster_id: &str,
+    message_id: &str,
+) {
+    let normalized = match normalize_payload(
+        state,
+        json_value,
+        body_len,
+        event_type,
+        broadcaster_id,
+        message_id,
+    ) {
+        Ok(event) => event,
+        Err(_) => return,
+    };
+
+    let settings = match state
+        .storage()
+        .broadcasters()
+        .fetch_settings(broadcaster_id)
+        .await
+    {
+        Ok(settings) => settings,
+        Err(err) => {
+            emit_policy_error(state, broadcaster_id, &normalized, err);
+            return;
+        }
+    };
+
+    evaluate_policy(state, broadcaster_id, &normalized, &settings);
+}
+
+fn normalize_payload(
+    state: &AppState,
+    json_value: &Value,
+    body_len: u64,
+    event_type: &str,
+    broadcaster_id: &str,
+    message_id: &str,
+) -> Result<NormalizedEvent, ()> {
+    let start = Instant::now();
+    let normalized = match Normalizer::normalize(event_type, json_value) {
+        Ok(event) => event,
+        Err(err) => {
+            emit_normalizer_error(
+                state,
+                json_value,
+                event_type,
+                broadcaster_id,
+                message_id,
+                err,
+                body_len,
+                start,
+            );
+            return Err(());
+        }
+    };
+
+    emit_normalizer_stage(
+        state,
+        json_value,
+        &normalized,
+        broadcaster_id,
+        message_id,
+        body_len,
+        start.elapsed().as_secs_f64(),
+    );
+
+    Ok(normalized)
+}
+
+fn emit_normalizer_stage(
+    state: &AppState,
+    json_value: &Value,
+    normalized: &NormalizedEvent,
+    broadcaster_id: &str,
+    message_id: &str,
+    body_len: u64,
+    elapsed_secs: f64,
+) {
+    let sanitized = sanitize_payload(json_value);
+    let event = StageEvent {
+        ts: state.now(),
+        stage: StageKind::Normalizer,
+        trace_id: None,
+        op_id: None,
+        version: None,
+        broadcaster_id: Some(broadcaster_id.to_string()),
+        meta: StageMetadata {
+            msg_id: Some(message_id.to_string()),
+            event_type: Some(normalized.event_type().to_string()),
+            size_bytes: Some(body_len),
+            latency_ms: Some(elapsed_secs * 1000.0),
+            ..StageMetadata::default()
+        },
+        r#in: StagePayload {
+            redacted: true,
+            payload: sanitized,
+            truncated: None,
+        },
+        out: StagePayload {
+            redacted: true,
+            payload: normalized.redacted(),
+            truncated: None,
+        },
+    };
+    state.tap().publish(event);
+}
+
+fn emit_normalizer_error(
+    state: &AppState,
+    json_value: &Value,
+    event_type: &str,
+    broadcaster_id: &str,
+    message_id: &str,
+    err: NormalizerError,
+    body_len: u64,
+    start: Instant,
+) {
+    error!(
+        stage = "normalizer",
+        %message_id,
+        broadcaster_id,
+        error = %err,
+        "failed to normalize payload"
+    );
+
+    let sanitized = sanitize_payload(json_value);
+    let event = StageEvent {
+        ts: state.now(),
+        stage: StageKind::Normalizer,
+        trace_id: None,
+        op_id: None,
+        version: None,
+        broadcaster_id: Some(broadcaster_id.to_string()),
+        meta: StageMetadata {
+            msg_id: Some(message_id.to_string()),
+            event_type: Some(event_type.to_string()),
+            size_bytes: Some(body_len),
+            latency_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+            message: Some("normalization_failed".to_string()),
+            ..StageMetadata::default()
+        },
+        r#in: StagePayload {
+            redacted: true,
+            payload: sanitized,
+            truncated: None,
+        },
+        out: StagePayload {
+            redacted: true,
+            payload: json!({ "error": err.to_string() }),
+            truncated: None,
+        },
+    };
+    state.tap().publish(event);
+}
+
+fn evaluate_policy(
+    state: &AppState,
+    broadcaster_id: &str,
+    normalized: &NormalizedEvent,
+    settings: &Settings,
+) {
+    let issued_at = state.now();
+    let start = Instant::now();
+    let outcome = state.policy().evaluate(settings, normalized, issued_at);
+    let mut meta = StageMetadata {
+        event_type: Some(normalized.event_type().to_string()),
+        latency_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+        ..StageMetadata::default()
+    };
+
+    if outcome.is_duplicate() {
+        meta.message = Some("duplicate".to_string());
+    }
+
+    let event = StageEvent {
+        ts: state.now(),
+        stage: StageKind::Policy,
+        trace_id: None,
+        op_id: None,
+        version: None,
+        broadcaster_id: Some(broadcaster_id.to_string()),
+        meta,
+        r#in: StagePayload {
+            redacted: true,
+            payload: normalized.redacted(),
+            truncated: None,
+        },
+        out: StagePayload {
+            redacted: true,
+            payload: outcome.redacted(),
+            truncated: None,
+        },
+    };
+    state.tap().publish(event);
+
+    for command in &outcome.commands {
+        counter!("policy_commands_total", 1, "kind" => command.metric_kind());
+    }
+}
+
+fn emit_policy_error(
+    state: &AppState,
+    broadcaster_id: &str,
+    normalized: &NormalizedEvent,
+    err: SettingsError,
+) {
+    error!(
+        stage = "policy",
+        broadcaster_id,
+        error = %err,
+        "failed to load broadcaster settings"
+    );
+
+    let event = StageEvent {
+        ts: state.now(),
+        stage: StageKind::Policy,
+        trace_id: None,
+        op_id: None,
+        version: None,
+        broadcaster_id: Some(broadcaster_id.to_string()),
+        meta: StageMetadata {
+            event_type: Some(normalized.event_type().to_string()),
+            message: Some("settings_error".to_string()),
+            ..StageMetadata::default()
+        },
+        r#in: StagePayload {
+            redacted: true,
+            payload: normalized.redacted(),
+            truncated: None,
+        },
+        out: StagePayload {
+            redacted: true,
+            payload: json!({ "error": err.to_string() }),
+            truncated: None,
+        },
+    };
+    state.tap().publish(event);
+}
+
+fn sanitize_payload(value: &Value) -> Value {
+    let mut sanitized = serde_json::Map::new();
+    if let Some(subscription_type) = value
+        .get("subscription")
+        .and_then(|sub| sub.get("type"))
+        .and_then(Value::as_str)
+    {
+        sanitized.insert(
+            "subscription_type".to_string(),
+            Value::String(subscription_type.to_string()),
+        );
+    }
+    if let Some(event) = value.get("event").and_then(Value::as_object) {
+        if let Some(id) = event.get("id") {
+            sanitized.insert("event_id".to_string(), id.clone());
+        }
+        if let Some(user_id) = event.get("user_id") {
+            sanitized.insert("user_id".to_string(), user_id.clone());
+        }
+        if let Some(redeemed_at) = event.get("redeemed_at") {
+            sanitized.insert("occurred_at".to_string(), redeemed_at.clone());
+        }
+        if let Some(reward_id) = event
+            .get("reward")
+            .and_then(Value::as_object)
+            .and_then(|reward| reward.get("id"))
+        {
+            sanitized.insert("reward_id".to_string(), reward_id.clone());
+        }
+    }
+    Value::Object(sanitized)
 }
 
 struct TapPublish<'a> {
@@ -470,6 +762,8 @@ mod tests {
     use crate::{router::app_router, telemetry};
     use twi_overlay_storage::Database;
 
+    use serde_json::{json, Value};
+
     const BROADCASTER_ID: &str = "b-123";
     const FIXED_NOW: &str = "2024-01-01T00:00:00Z";
 
@@ -492,6 +786,18 @@ mod tests {
             .expect("fixed time")
             .with_timezone(&Utc);
 
+        let settings = json!({
+            "overlay_theme": "neon",
+            "group_size": 1,
+            "clear_on_stream_start": false,
+            "clear_decrement_counts": false,
+            "policy": {
+                "anti_spam_window_sec": 60,
+                "duplicate_policy": "consume",
+                "target_rewards": ["reward-1"]
+            }
+        });
+
         query(
             "INSERT INTO broadcasters (id, twitch_broadcaster_id, display_name, timezone, settings_json, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -500,7 +806,7 @@ mod tests {
         .bind("twitch-".to_string() + BROADCASTER_ID)
         .bind("Test Broadcaster")
         .bind("UTC")
-        .bind("{}")
+        .bind(settings.to_string())
         .bind(now.to_rfc3339_opts(SecondsFormat::Secs, true))
         .bind(now.to_rfc3339_opts(SecondsFormat::Secs, true))
         .execute(database.pool())
@@ -573,7 +879,7 @@ mod tests {
     }
 
     fn notification_body() -> String {
-        serde_json::json!({
+        json!({
             "subscription": {
                 "type": "channel.channel_points_custom_reward_redemption.add",
                 "version": "1",
@@ -581,7 +887,17 @@ mod tests {
             },
             "event": {
                 "broadcaster_user_id": BROADCASTER_ID,
-                "id": "event-1"
+                "id": "event-1",
+                "user_id": "user-1",
+                "user_login": "viewer_one",
+                "user_name": "Viewer One",
+                "status": "UNFULFILLED",
+                "redeemed_at": FIXED_NOW,
+                "reward": {
+                    "id": "reward-1",
+                    "title": "Join Queue",
+                    "cost": 1
+                }
             }
         })
         .to_string()
@@ -650,6 +966,31 @@ mod tests {
             .expect("event value");
         assert_eq!(event.stage, StageKind::Ingress);
         assert_eq!(event.meta.msg_id.as_deref(), Some(message_id));
+
+        let normalizer =
+            tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+                .await
+                .expect("normalizer event available")
+                .expect("event value");
+        assert_eq!(normalizer.stage, StageKind::Normalizer);
+        assert_eq!(
+            normalizer.meta.event_type.as_deref(),
+            Some("redemption.add")
+        );
+
+        let policy = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+            .await
+            .expect("policy event available")
+            .expect("event value");
+        assert_eq!(policy.stage, StageKind::Policy);
+        assert_eq!(policy.meta.event_type.as_deref(), Some("redemption.add"));
+        let commands = policy
+            .out
+            .payload
+            .get("commands")
+            .and_then(Value::as_array)
+            .expect("commands array");
+        assert_eq!(commands.len(), 2);
     }
 
     #[tokio::test]

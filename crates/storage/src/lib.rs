@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::{migrate::MigrateError, sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{migrate::MigrateError, sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
+
+use twi_overlay_core::types::Settings;
 
 /// Top-level database handle that owns the SQLite connection pool.
 #[derive(Clone)]
@@ -37,6 +39,13 @@ impl Database {
     /// Returns a handle to interact with the EventRaw repository.
     pub fn event_raw(&self) -> EventRawRepository {
         EventRawRepository {
+            pool: self.pool.clone(),
+        }
+    }
+
+    /// Returns a handle for interacting with broadcasters metadata.
+    pub fn broadcasters(&self) -> BroadcasterRepository {
+        BroadcasterRepository {
             pool: self.pool.clone(),
         }
     }
@@ -80,6 +89,38 @@ pub enum StorageError {
     Pragma(sqlx::Error),
     #[error("failed to run database migrations: {0}")]
     Migration(MigrateError),
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Repository used to query broadcaster metadata and settings.
+#[derive(Clone)]
+pub struct BroadcasterRepository {
+    pool: SqlitePool,
+}
+
+impl BroadcasterRepository {
+    /// Loads the settings JSON for the provided broadcaster.
+    pub async fn fetch_settings(&self, broadcaster_id: &str) -> Result<Settings, SettingsError> {
+        let row = sqlx::query("SELECT settings_json FROM broadcasters WHERE id = ?")
+            .bind(broadcaster_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(SettingsError::NotFound)?;
+
+        let json_value: String = row.get("settings_json");
+        let settings: Settings = serde_json::from_str(&json_value)?;
+        Ok(settings)
+    }
+}
+
+/// Errors that can occur while reading settings.
+#[derive(Debug, Error)]
+pub enum SettingsError {
+    #[error("broadcaster not found")]
+    NotFound,
+    #[error("failed to decode settings json: {0}")]
+    Decode(#[from] serde_json::Error),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -254,5 +295,22 @@ mod tests {
                 .await
                 .expect("fetch tables");
         assert!(tables.0 >= 6, "expected core tables to be created");
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_returns_defaults() {
+        let db = setup_db().await;
+        let repo = db.broadcasters();
+        let settings = repo.fetch_settings("b-1").await.expect("settings load");
+        assert!(settings.policy().target_rewards.is_empty());
+        assert_eq!(settings.policy().anti_spam_window_sec, 60);
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_errors_for_missing_broadcaster() {
+        let db = setup_db().await;
+        let repo = db.broadcasters();
+        let err = repo.fetch_settings("missing").await.unwrap_err();
+        assert!(matches!(err, SettingsError::NotFound));
     }
 }
