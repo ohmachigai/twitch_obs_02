@@ -353,16 +353,16 @@ fn normalize_payload(
     let normalized = match Normalizer::normalize(event_type, json_value) {
         Ok(event) => event,
         Err(err) => {
-            emit_normalizer_error(
-                state,
+            let context = NormalizerErrorContext {
                 json_value,
                 event_type,
                 broadcaster_id,
                 message_id,
-                err,
                 body_len,
-                start,
-            );
+                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
+                error: err,
+            };
+            emit_normalizer_error(state, context);
             return Err(());
         }
     };
@@ -418,16 +418,16 @@ fn emit_normalizer_stage(
     state.tap().publish(event);
 }
 
-fn emit_normalizer_error(
-    state: &AppState,
-    json_value: &Value,
-    event_type: &str,
-    broadcaster_id: &str,
-    message_id: &str,
-    err: NormalizerError,
-    body_len: u64,
-    start: Instant,
-) {
+fn emit_normalizer_error(state: &AppState, context: NormalizerErrorContext<'_>) {
+    let NormalizerErrorContext {
+        json_value,
+        event_type,
+        broadcaster_id,
+        message_id,
+        body_len,
+        latency_ms,
+        error: err,
+    } = context;
     error!(
         stage = "normalizer",
         %message_id,
@@ -448,7 +448,7 @@ fn emit_normalizer_error(
             msg_id: Some(message_id.to_string()),
             event_type: Some(event_type.to_string()),
             size_bytes: Some(body_len),
-            latency_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+            latency_ms: Some(latency_ms),
             message: Some("normalization_failed".to_string()),
             ..StageMetadata::default()
         },
@@ -464,6 +464,15 @@ fn emit_normalizer_error(
         },
     };
     state.tap().publish(event);
+}
+struct NormalizerErrorContext<'a> {
+    json_value: &'a Value,
+    event_type: &'a str,
+    broadcaster_id: &'a str,
+    message_id: &'a str,
+    body_len: u64,
+    latency_ms: f64,
+    error: NormalizerError,
 }
 
 fn evaluate_policy(

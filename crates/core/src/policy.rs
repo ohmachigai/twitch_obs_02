@@ -34,15 +34,16 @@ impl PolicyEngine {
                 user,
                 reward,
                 occurred_at,
-            } => self.evaluate_redemption_add(
-                settings,
-                broadcaster_id,
-                redemption_id,
-                user,
-                reward,
-                *occurred_at,
-                issued_at,
-            ),
+            } => {
+                let context = RedemptionAddContext {
+                    broadcaster_id,
+                    redemption_id,
+                    user,
+                    reward,
+                    occurred_at: *occurred_at,
+                };
+                self.evaluate_redemption_add(settings, context, issued_at)
+            }
             _ => PolicyOutcome::ignored("event_not_supported"),
         }
     }
@@ -50,13 +51,16 @@ impl PolicyEngine {
     fn evaluate_redemption_add(
         &self,
         settings: &Settings,
-        broadcaster_id: &str,
-        redemption_id: &str,
-        user: &NormalizedUser,
-        reward: &NormalizedReward,
-        occurred_at: DateTime<Utc>,
+        context: RedemptionAddContext<'_>,
         issued_at: DateTime<Utc>,
     ) -> PolicyOutcome {
+        let RedemptionAddContext {
+            broadcaster_id,
+            redemption_id,
+            user,
+            reward,
+            occurred_at,
+        } = context;
         let policy = settings.policy();
         if policy.target_rewards.is_empty() {
             return PolicyOutcome::ignored("policy_disabled");
@@ -118,6 +122,14 @@ impl PolicyEngine {
             PolicyOutcome::applied(vec![enqueue, update])
         }
     }
+}
+
+struct RedemptionAddContext<'a> {
+    broadcaster_id: &'a str,
+    redemption_id: &'a str,
+    user: &'a NormalizedUser,
+    reward: &'a NormalizedReward,
+    occurred_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
