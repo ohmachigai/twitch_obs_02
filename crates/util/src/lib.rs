@@ -6,6 +6,17 @@ pub use config::{AppConfig, ConfigError, Environment};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static ENV_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    pub fn env_vars_lock() -> MutexGuard<'static, ()> {
+        ENV_GUARD.lock().expect("env guard poisoned")
+    }
+}
+
 /// Loads environment variables from `.env` when available.
 ///
 /// Missing files are ignored so the function is safe in production builds
@@ -26,16 +37,12 @@ pub fn server_bind_address() -> Result<SocketAddr, std::net::AddrParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        env,
-        sync::{LazyLock, Mutex},
-    };
-
-    static ENV_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    use crate::test_support;
+    use std::env;
 
     #[test]
     fn returns_default_address_when_env_missing() {
-        let _lock = ENV_GUARD.lock().expect("env guard poisoned");
+        let _lock = test_support::env_vars_lock();
         env::remove_var("APP_BIND_ADDR");
         let addr = server_bind_address().expect("default address is valid");
         assert_eq!(addr.to_string(), DEFAULT_BIND_ADDR);
@@ -43,7 +50,7 @@ mod tests {
 
     #[test]
     fn parses_custom_address_from_env() {
-        let _lock = ENV_GUARD.lock().expect("env guard poisoned");
+        let _lock = test_support::env_vars_lock();
         env::set_var("APP_BIND_ADDR", "0.0.0.0:9000");
         let addr = server_bind_address().expect("custom address should parse");
         assert_eq!(addr.to_string(), "0.0.0.0:9000");

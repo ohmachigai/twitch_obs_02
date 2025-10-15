@@ -2462,6 +2462,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
+ "twi-overlay-core",
  "twi-overlay-storage",
  "twi-overlay-util",
  "uuid",
@@ -2470,6 +2471,12 @@ dependencies = [
 [[package]]
 name = "twi-overlay-core"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "twi-overlay-storage"
@@ -2480,6 +2487,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "twi-overlay-core",
  "uuid",
 ]
 

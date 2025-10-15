@@ -11,6 +11,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
+use twi_overlay_core::policy::PolicyEngine;
 use twi_overlay_storage::Database;
 
 use crate::tap::{parse_stage_list, tap_keep_alive, tap_stream, TapFilter, TapHub};
@@ -23,6 +24,7 @@ pub struct AppState {
     storage: Database,
     webhook_secret: Arc<[u8]>,
     clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    policy_engine: Arc<PolicyEngine>,
 }
 
 impl AppState {
@@ -38,6 +40,7 @@ impl AppState {
             storage,
             webhook_secret,
             clock: Arc::new(Utc::now),
+            policy_engine: Arc::new(PolicyEngine::new()),
         }
     }
 
@@ -65,6 +68,10 @@ impl AppState {
 
     pub fn now(&self) -> DateTime<Utc> {
         (self.clock)()
+    }
+
+    pub fn policy(&self) -> Arc<PolicyEngine> {
+        self.policy_engine.clone()
     }
 }
 
