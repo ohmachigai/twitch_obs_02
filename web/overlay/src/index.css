@@ -1,9 +1,11 @@
 :root {
-  color-scheme: light;
+  color-scheme: dark;
 }
 
 body {
   margin: 0;
+  background: transparent;
+  min-height: 100vh;
 }
 
 #root {

@@ -14,17 +14,18 @@ use axum::response::sse::Event;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use metrics::{counter, gauge, histogram};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::to_string;
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 
 use twi_overlay_core::projector::Projector;
-use twi_overlay_core::types::{Patch, StateSnapshot, UserCounter};
+use twi_overlay_core::types::Patch;
 use twi_overlay_storage::{BroadcasterSettings, Database, StateIndexError};
 
 use crate::command::CommandExecutorError;
+use crate::state::{build_state_snapshot, StateError, StateScope};
 
 const EVENT_NAME: &str = "patch";
 const BROADCAST_BUFFER: usize = 256;
@@ -54,6 +55,8 @@ impl SseTokenValidator {
     pub fn new(secret: Vec<u8>) -> Self {
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_aud = false;
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
         Self {
             decoding_key: DecodingKey::from_secret(&secret),
             validation,
@@ -67,14 +70,45 @@ impl SseTokenValidator {
         broadcaster_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), TokenError> {
-        let data = decode::<TokenClaims>(token, &self.decoding_key, &self.validation)
-            .map_err(|err| TokenError::Invalid(format!("{err}")))?;
-        let claims = data.claims;
-        if claims.sub != broadcaster_id {
-            return Err(TokenError::Invalid("subject_mismatch".to_string()));
-        }
+        let claims = self.decode_claims(token)?;
+        self.validate_claims(&claims, broadcaster_id, now)?;
         if claims.aud != expected_audience.as_str() {
             return Err(TokenError::Invalid("audience_mismatch".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn validate_any(
+        &self,
+        token: &str,
+        audiences: &[Audience],
+        broadcaster_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Audience, TokenError> {
+        let claims = self.decode_claims(token)?;
+        self.validate_claims(&claims, broadcaster_id, now)?;
+        let matched = audiences
+            .iter()
+            .copied()
+            .find(|aud| claims.aud == aud.as_str())
+            .ok_or_else(|| TokenError::Invalid("audience_mismatch".to_string()))?;
+        Ok(matched)
+    }
+
+    fn decode_claims(&self, token: &str) -> Result<TokenClaims, TokenError> {
+        let data = decode::<TokenClaims>(token, &self.decoding_key, &self.validation)
+            .map_err(|err| TokenError::Invalid(format!("{err}")))?;
+        Ok(data.claims)
+    }
+
+    fn validate_claims(
+        &self,
+        claims: &TokenClaims,
+        broadcaster_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), TokenError> {
+        if claims.sub != broadcaster_id {
+            return Err(TokenError::Invalid("subject_mismatch".to_string()));
         }
         let now_ts = now.timestamp();
         if let Some(nbf) = claims.nbf {
@@ -89,13 +123,13 @@ impl SseTokenValidator {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenClaims {
-    sub: String,
-    aud: String,
-    exp: usize,
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TokenClaims {
+    pub sub: String,
+    pub aud: String,
+    pub exp: usize,
     #[serde(default)]
-    nbf: Option<usize>,
+    pub nbf: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -214,35 +248,16 @@ impl SseHub {
         profile: &BroadcasterSettings,
         now: DateTime<Utc>,
     ) -> Result<Patch, SseError> {
-        let state_index = self.database.state_index();
-        let queue_repo = self.database.queue();
-        let counter_repo = self.database.daily_counters();
-
-        let version = state_index
-            .fetch_current_version(broadcaster_id)
-            .await
-            .map_err(SseError::from)?;
-        let day = crate::command::compute_local_day(now, &profile.timezone)?;
-        let entries = queue_repo
-            .list_active_with_counts(broadcaster_id, &day)
-            .await?;
-        let queue: Vec<_> = entries.into_iter().map(|row| row.into_domain().0).collect();
-        let counters = counter_repo
-            .list_for_day(broadcaster_id, &day)
-            .await?
-            .into_iter()
-            .map(|row| UserCounter {
-                user_id: row.user_id,
-                count: row.count as u32,
-            })
-            .collect();
-        let snapshot = StateSnapshot {
-            version,
-            queue,
-            counters_today: counters,
-            settings: profile.settings.clone(),
-        };
-        Ok(Projector::state_replace(version, now, snapshot))
+        let snapshot = build_state_snapshot(
+            &self.database,
+            broadcaster_id,
+            profile,
+            now,
+            StateScope::Session,
+        )
+        .await
+        .map_err(SseError::from)?;
+        Ok(Projector::state_replace(snapshot.version, now, snapshot))
     }
 
     pub(crate) fn event_from_patch(&self, patch: &Patch) -> Result<Arc<SseMessage>, SseError> {
@@ -456,4 +471,6 @@ pub enum SseError {
     Command(#[from] CommandExecutorError),
     #[error("state index error: {0}")]
     StateIndex(#[from] StateIndexError),
+    #[error("state snapshot error: {0}")]
+    State(#[from] StateError),
 }

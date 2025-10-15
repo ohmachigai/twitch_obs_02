@@ -66,6 +66,9 @@ jobs:
       - name: Type check
         working-directory: web/overlay
         run: npm run typecheck
+      - name: Test
+        working-directory: web/overlay
+        run: npm run test
       - name: Build
         working-directory: web/overlay
         run: npm run build

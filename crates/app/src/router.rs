@@ -6,18 +6,27 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{sse::Sse, IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
+use serde_json::json;
+use tracing::{error, info};
 use twi_overlay_core::policy::PolicyEngine;
 use twi_overlay_storage::{Database, SettingsError};
 
 use crate::command::CommandExecutor;
-use crate::sse::{Audience, SseHub, SseStream, SseTokenValidator};
-use crate::tap::{parse_stage_list, tap_keep_alive, tap_stream, TapFilter, TapHub};
+use crate::problem::ProblemResponse;
+use crate::sse::{Audience, SseHub, SseStream, SseTokenValidator, TokenError};
+use crate::state::{build_state_snapshot, StateScope};
+use crate::tap::{
+    parse_stage_list, tap_keep_alive, tap_stream, StageEvent, StageKind, StageMetadata,
+    StagePayload, TapFilter, TapHub,
+};
 use crate::{telemetry, webhook};
+use twi_overlay_core::types::StateSnapshot;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -118,6 +127,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/_debug/tap", get(debug_tap))
         .route("/overlay/sse", get(overlay_sse))
         .route("/admin/sse", get(admin_sse))
+        .route("/api/state", get(state_snapshot))
         .route("/eventsub/webhook", post(webhook::handle))
         .with_state(state)
 }
@@ -152,6 +162,17 @@ struct SseQuery {
     token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StateQuery {
+    broadcaster: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
 async fn debug_tap(
     State(state): State<AppState>,
     Query(query): Query<TapQuery>,
@@ -180,6 +201,148 @@ async fn admin_sse(
     headers: HeaderMap,
 ) -> Result<Sse<SseStream>, (StatusCode, String)> {
     sse_handler(state, query, headers, Audience::Admin).await
+}
+
+async fn state_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<StateQuery>,
+    headers: HeaderMap,
+) -> Result<Json<StateSnapshot>, ProblemResponse> {
+    let token = extract_bearer_token(&headers)
+        .map(|value| value.to_string())
+        .or_else(|| query.token.clone())
+        .ok_or_else(|| {
+            counter!("api_state_requests_total", 1, "result" => "unauthorized");
+            ProblemResponse::new(
+                StatusCode::UNAUTHORIZED,
+                "missing_token",
+                "state endpoint requires a bearer token",
+            )
+        })?;
+
+    let now = state.now();
+    let audience = match state.token_validator().validate_any(
+        &token,
+        &[Audience::Overlay, Audience::Admin],
+        &query.broadcaster,
+        now,
+    ) {
+        Ok(audience) => audience,
+        Err(err) => {
+            counter!("api_state_requests_total", 1, "result" => "unauthorized");
+            return Err(problem_for_token_error(err));
+        }
+    };
+
+    let scope = match parse_state_scope(query.scope.as_deref(), query.since.as_deref()) {
+        Ok(scope) => scope,
+        Err(problem) => {
+            counter!("api_state_requests_total", 1, "result" => "error");
+            return Err(problem);
+        }
+    };
+
+    let profile = match state
+        .storage()
+        .broadcasters()
+        .fetch_settings(&query.broadcaster)
+        .await
+    {
+        Ok(profile) => profile,
+        Err(SettingsError::NotFound) => {
+            counter!("api_state_requests_total", 1, "result" => "error");
+            return Err(ProblemResponse::new(
+                StatusCode::NOT_FOUND,
+                "broadcaster_not_found",
+                "broadcaster is not provisioned",
+            ));
+        }
+        Err(err) => {
+            counter!("api_state_requests_total", 1, "result" => "error");
+            error!(
+                stage = "state",
+                broadcaster = %query.broadcaster,
+                error = %err,
+                "failed to load broadcaster settings"
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_error",
+                "failed to load broadcaster settings",
+            ));
+        }
+    };
+
+    let snapshot =
+        match build_state_snapshot(state.storage(), &query.broadcaster, &profile, now, scope).await
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                counter!("api_state_requests_total", 1, "result" => "error");
+                error!(
+                    stage = "state",
+                    broadcaster = %query.broadcaster,
+                    error = %err,
+                    "failed to build state snapshot"
+                );
+                return Err(ProblemResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "state_error",
+                    "failed to build state snapshot",
+                ));
+            }
+        };
+
+    counter!("api_state_requests_total", 1, "result" => "ok");
+
+    let scope_label = match scope {
+        StateScope::Session => "session",
+        StateScope::Since(_) => "since",
+    };
+
+    info!(
+        stage = "state",
+        broadcaster = %query.broadcaster,
+        scope = scope_label,
+        version = snapshot.version,
+        audience = audience.as_str(),
+        queue_len = snapshot.queue.len(),
+        counter_len = snapshot.counters_today.len(),
+        "state snapshot served"
+    );
+
+    let event = StageEvent {
+        ts: state.now(),
+        stage: StageKind::State,
+        trace_id: None,
+        op_id: None,
+        version: Some(snapshot.version),
+        broadcaster_id: Some(query.broadcaster.clone()),
+        meta: StageMetadata {
+            message: Some(scope_label.to_string()),
+            ..StageMetadata::default()
+        },
+        r#in: StagePayload {
+            redacted: true,
+            payload: json!({
+                "scope": scope_label,
+                "since": query.since,
+                "aud": audience.as_str(),
+            }),
+            truncated: None,
+        },
+        out: StagePayload {
+            redacted: false,
+            payload: json!({
+                "queue_count": snapshot.queue.len(),
+                "counter_count": snapshot.counters_today.len(),
+            }),
+            truncated: None,
+        },
+    };
+    state.tap().publish(event);
+
+    Ok(Json(snapshot))
 }
 
 async fn sse_handler(
@@ -268,15 +431,72 @@ fn parse_types(raw: Option<String>) -> Result<Option<HashSet<String>>, (StatusCo
     Ok(Some(set))
 }
 
+fn problem_for_token_error(err: TokenError) -> ProblemResponse {
+    ProblemResponse::new(StatusCode::FORBIDDEN, "invalid_token", err.to_string())
+}
+
+fn parse_state_scope(
+    scope: Option<&str>,
+    since: Option<&str>,
+) -> Result<StateScope, ProblemResponse> {
+    match scope {
+        None | Some("session") => Ok(StateScope::Session),
+        Some("since") => {
+            let since_raw = since.ok_or_else(|| {
+                ProblemResponse::new(
+                    StatusCode::BAD_REQUEST,
+                    "missing_since",
+                    "scope=since requires the since parameter",
+                )
+            })?;
+            let parsed = DateTime::parse_from_rfc3339(since_raw).map_err(|err| {
+                ProblemResponse::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_since",
+                    format!("invalid since timestamp: {err}"),
+                )
+            })?;
+            Ok(StateScope::Since(parsed.with_timezone(&Utc)))
+        }
+        Some(other) => Err(ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            format!("unsupported scope: {other}"),
+        )),
+    }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::Body,
+        http::{HeaderValue, Request, StatusCode},
+    };
+    use chrono::{Duration as ChronoDuration, SecondsFormat, TimeZone};
     use http_body_util::BodyExt;
-    use std::time::Duration as StdDuration;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde_json::Value;
+    use serde_urlencoded::to_string;
+    use sqlx::query;
+    use std::{sync::Arc, time::Duration as StdDuration};
     use tokio::time::{self, Duration};
     use tower::ServiceExt;
 
+    use crate::sse::TokenClaims;
     use crate::tap::StageEvent;
 
     async fn setup_state() -> AppState {
@@ -299,6 +519,101 @@ mod tests {
             StdDuration::from_secs(60),
             25,
         )
+    }
+
+    fn issue_token(
+        secret: &[u8],
+        broadcaster: &str,
+        audience: &str,
+        exp: chrono::DateTime<Utc>,
+    ) -> String {
+        let claims = TokenClaims {
+            sub: broadcaster.to_string(),
+            aud: audience.to_string(),
+            exp: exp.timestamp() as usize,
+            nbf: None,
+        };
+        let header = Header::new(Algorithm::HS256);
+        encode(&header, &claims, &EncodingKey::from_secret(secret)).expect("token encode")
+    }
+
+    fn bearer(value: &str) -> HeaderValue {
+        let header_value = format!("Bearer {value}");
+        HeaderValue::from_str(&header_value).expect("header value")
+    }
+
+    fn fmt_time(value: chrono::DateTime<Utc>) -> String {
+        value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    async fn provision_broadcaster(state: &AppState, version: i64) {
+        let pool = state.storage().pool();
+        let created_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        query(
+            "INSERT INTO broadcasters (id, twitch_broadcaster_id, display_name, timezone, settings_json, created_at, updated_at) VALUES ('b-1','twitch-1','Example','UTC',?, ?, ?)",
+        )
+        .bind("{}")
+        .bind(fmt_time(created_at))
+        .bind(fmt_time(created_at))
+        .execute(pool)
+        .await
+        .expect("insert broadcaster");
+
+        query(
+            "INSERT INTO state_index (broadcaster_id, current_version, updated_at) VALUES ('b-1', ?, ?)",
+        )
+        .bind(version)
+        .bind(fmt_time(created_at))
+        .execute(pool)
+        .await
+        .expect("insert state index");
+    }
+
+    async fn insert_queue_entry(
+        state: &AppState,
+        id: &str,
+        user_id: &str,
+        enqueued_at: chrono::DateTime<Utc>,
+        last_updated_at: chrono::DateTime<Utc>,
+    ) {
+        let pool = state.storage().pool();
+        query(
+            r#"INSERT INTO queue_entries (
+                id, broadcaster_id, user_id, user_login, user_display_name, user_avatar,
+                reward_id, redemption_id, enqueued_at, status, status_reason, managed, last_updated_at
+            ) VALUES (?, 'b-1', ?, ?, ?, ?, 'reward-1', ?, ?, 'QUEUED', NULL, 0, ?)"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(format!("{user_id}-login"))
+        .bind(format!("User {user_id}"))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::Some(format!("red-{id}")))
+        .bind(fmt_time(enqueued_at))
+        .bind(fmt_time(last_updated_at))
+        .execute(pool)
+        .await
+        .expect("insert queue entry");
+    }
+
+    async fn insert_counter(
+        state: &AppState,
+        user_id: &str,
+        count: i64,
+        updated_at: chrono::DateTime<Utc>,
+    ) {
+        let pool = state.storage().pool();
+        let day = updated_at.format("%Y-%m-%d").to_string();
+        query(
+            "INSERT INTO daily_counters(day, broadcaster_id, user_id, count, updated_at) VALUES (?, 'b-1', ?, ?, ?)",
+        )
+        .bind(day)
+        .bind(user_id)
+        .bind(count)
+        .bind(fmt_time(updated_at))
+        .execute(pool)
+        .await
+        .expect("insert counter");
     }
 
     #[tokio::test]
@@ -376,5 +691,206 @@ mod tests {
         assert!(text.contains("\"stage\":\"sse\""));
 
         publish.await.expect("publish task");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_requires_token() {
+        let app = app_router(setup_state().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state?broadcaster=b-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("handler should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_returns_session_scope() {
+        let fixed_now = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
+        let clock_now = fixed_now;
+        let state = setup_state().await.with_clock(Arc::new(move || clock_now));
+        provision_broadcaster(&state, 42).await;
+        insert_queue_entry(
+            &state,
+            "entry-1",
+            "user-1",
+            fixed_now - ChronoDuration::minutes(5),
+            fixed_now - ChronoDuration::minutes(5),
+        )
+        .await;
+        insert_counter(&state, "user-1", 3, fixed_now - ChronoDuration::minutes(4)).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Overlay.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let app = app_router(state.clone());
+
+        state
+            .token_validator()
+            .validate_any(
+                &token,
+                &[Audience::Overlay, Audience::Admin],
+                "b-1",
+                fixed_now,
+            )
+            .expect("token should be accepted");
+
+        let profile = state
+            .storage()
+            .broadcasters()
+            .fetch_settings("b-1")
+            .await
+            .expect("profile should load");
+        build_state_snapshot(
+            state.storage(),
+            "b-1",
+            &profile,
+            fixed_now,
+            StateScope::Session,
+        )
+        .await
+        .expect("snapshot should build");
+
+        let mut response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state?broadcaster=b-1")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("handler should respond");
+
+        if response.status() != StatusCode::OK {
+            let body = response.body_mut().collect().await.unwrap().to_bytes();
+            panic!(
+                "unexpected status {} body {}",
+                response.status(),
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json.get("version").and_then(Value::as_u64), Some(42));
+        assert_eq!(
+            json.get("queue")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len()),
+            Some(1)
+        );
+        assert_eq!(
+            json.get("counters_today")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_since_filters_old_records() {
+        let fixed_now = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
+        let clock_now = fixed_now;
+        let state = setup_state().await.with_clock(Arc::new(move || clock_now));
+        provision_broadcaster(&state, 55).await;
+        let earlier = fixed_now - ChronoDuration::minutes(30);
+        let recent = fixed_now - ChronoDuration::minutes(5);
+        insert_queue_entry(&state, "entry-early", "user-1", earlier, earlier).await;
+        insert_queue_entry(&state, "entry-recent", "user-2", recent, recent).await;
+        insert_counter(&state, "user-1", 2, earlier).await;
+        insert_counter(&state, "user-2", 5, recent).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Overlay.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let since = (fixed_now - ChronoDuration::minutes(10)).to_rfc3339();
+        let query = to_string([
+            ("broadcaster", "b-1"),
+            ("scope", "since"),
+            ("since", since.as_str()),
+        ])
+        .expect("query should serialize");
+        let uri = format!("/api/state?{query}");
+        let app = app_router(state.clone());
+
+        state
+            .token_validator()
+            .validate_any(
+                &token,
+                &[Audience::Overlay, Audience::Admin],
+                "b-1",
+                fixed_now,
+            )
+            .expect("token should be accepted");
+
+        let profile = state
+            .storage()
+            .broadcasters()
+            .fetch_settings("b-1")
+            .await
+            .expect("profile should load");
+        build_state_snapshot(
+            state.storage(),
+            "b-1",
+            &profile,
+            fixed_now,
+            StateScope::Since(fixed_now - ChronoDuration::minutes(10)),
+        )
+        .await
+        .expect("snapshot should build");
+
+        let mut response = app
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("handler should respond");
+
+        if response.status() != StatusCode::OK {
+            let body = response.body_mut().collect().await.unwrap().to_bytes();
+            panic!(
+                "unexpected status {} body {}",
+                response.status(),
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).expect("json");
+        let queue = json
+            .get("queue")
+            .and_then(Value::as_array)
+            .expect("queue array");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue[0].get("id").and_then(Value::as_str),
+            Some("entry-recent")
+        );
+        let counters = json
+            .get("counters_today")
+            .and_then(Value::as_array)
+            .expect("counters array");
+        assert_eq!(counters.len(), 1);
+        assert_eq!(
+            counters[0].get("user_id").and_then(Value::as_str),
+            Some("user-2")
+        );
     }
 }

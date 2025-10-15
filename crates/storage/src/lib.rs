@@ -454,6 +454,48 @@ SELECT q.id,
 
         Ok(rows)
     }
+
+    pub async fn list_active_with_counts_since(
+        &self,
+        broadcaster_id: &str,
+        day: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<QueueEntryWithCount>, QueueError> {
+        let rows = sqlx::query_as::<_, QueueEntryWithCount>(
+            r#"
+SELECT q.id,
+       q.broadcaster_id,
+       q.user_id,
+       q.user_login,
+       q.user_display_name,
+       q.user_avatar,
+       q.reward_id,
+       q.redemption_id,
+       q.enqueued_at as "enqueued_at: DateTime<Utc>",
+       q.status,
+       q.status_reason,
+       q.managed,
+       q.last_updated_at as "last_updated_at: DateTime<Utc>",
+       COALESCE(dc.count, 0) as "today_count"
+  FROM queue_entries AS q
+  LEFT JOIN daily_counters AS dc
+    ON dc.day = ?
+   AND dc.broadcaster_id = q.broadcaster_id
+   AND dc.user_id = q.user_id
+ WHERE q.broadcaster_id = ?
+   AND q.status = 'QUEUED'
+   AND q.last_updated_at >= ?
+ ORDER BY today_count ASC, q.enqueued_at ASC
+            "#,
+        )
+        .bind(day)
+        .bind(broadcaster_id)
+        .bind(to_rfc3339(since))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
 }
 
 /// Parameters required to insert a queue entry.
@@ -484,10 +526,12 @@ pub struct QueueEntryWithCount {
     pub user_avatar: Option<String>,
     pub reward_id: String,
     pub redemption_id: Option<String>,
+    #[sqlx(rename = "enqueued_at: DateTime<Utc>")]
     pub enqueued_at: DateTime<Utc>,
     pub status: String,
     pub status_reason: Option<String>,
     pub managed: i64,
+    #[sqlx(rename = "last_updated_at: DateTime<Utc>")]
     pub last_updated_at: DateTime<Utc>,
     pub today_count: i64,
 }
@@ -579,6 +623,24 @@ impl DailyCounterRepository {
         )
         .bind(day)
         .bind(broadcaster_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    pub async fn list_updated_since(
+        &self,
+        broadcaster_id: &str,
+        day: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<DailyCounterValue>, DailyCounterError> {
+        let rows = sqlx::query_as::<_, DailyCounterValue>(
+            "SELECT user_id, count FROM daily_counters WHERE day = ? AND broadcaster_id = ? AND updated_at >= ? ORDER BY user_id",
+        )
+        .bind(day)
+        .bind(broadcaster_id)
+        .bind(to_rfc3339(since))
         .fetch_all(&self.pool)
         .await?;
 

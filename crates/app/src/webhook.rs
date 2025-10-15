@@ -4,12 +4,11 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use metrics::{counter, histogram};
-use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -21,6 +20,7 @@ use twi_overlay_storage::{
 };
 use uuid::Uuid;
 
+use crate::problem::ProblemResponse;
 use crate::router::AppState;
 use crate::tap::{StageEvent, StageKind, StageMetadata, StagePayload};
 
@@ -770,44 +770,6 @@ fn verify_signature(
         Ok(())
     } else {
         Err("signature mismatch".to_string())
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ProblemDetails {
-    #[serde(rename = "type")]
-    problem_type: &'static str,
-    title: &'static str,
-    detail: String,
-}
-
-pub struct ProblemResponse {
-    status: StatusCode,
-    body: ProblemDetails,
-}
-
-impl ProblemResponse {
-    pub fn new<S: Into<String>>(status: StatusCode, problem_type: &'static str, detail: S) -> Self {
-        Self {
-            status,
-            body: ProblemDetails {
-                problem_type,
-                title: status.canonical_reason().unwrap_or("error"),
-                detail: detail.into(),
-            },
-        }
-    }
-}
-
-impl IntoResponse for ProblemResponse {
-    fn into_response(self) -> Response {
-        let mut response = axum::Json(self.body).into_response();
-        *response.status_mut() = self.status;
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/problem+json"),
-        );
-        response
     }
 }
 
