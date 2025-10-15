@@ -138,6 +138,10 @@ pub fn init_metrics() -> Result<PrometheusHandle, TelemetryError> {
         "policy_commands_total",
         "Count of commands emitted by the policy engine labelled by kind"
     );
+    describe_counter!(
+        "api_state_requests_total",
+        "Count of state API requests, labelled by result"
+    );
     START_TIME.get_or_init(Instant::now);
 
     Ok(handle)

@@ -18,6 +18,7 @@ pub enum StageKind {
     Sse,
     Storage,
     Oauth,
+    State,
 }
 
 impl StageKind {
@@ -31,6 +32,7 @@ impl StageKind {
             StageKind::Sse => "sse",
             StageKind::Storage => "storage",
             StageKind::Oauth => "oauth",
+            StageKind::State => "state",
         }
     }
 }
@@ -221,6 +223,7 @@ pub fn parse_stage_list(value: Option<String>) -> Result<Option<HashSet<StageKin
             "sse" => StageKind::Sse,
             "storage" => StageKind::Storage,
             "oauth" => StageKind::Oauth,
+            "state" => StageKind::State,
             other => {
                 return Err(format!("unknown stage '{other}'"));
             }
