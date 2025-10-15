@@ -5,6 +5,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 
 pushd "$ROOT_DIR" > /dev/null
 
+: "${APP_ENV:=development}"
+: "${DATABASE_URL:=sqlite://$ROOT_DIR/dev.db}"
+: "${WEBHOOK_SECRET:=dev-secret-change-me}"
+export APP_ENV DATABASE_URL WEBHOOK_SECRET
+
 cleanup() {
   if [[ -n "${SERVER_PID:-}" ]]; then
     kill "$SERVER_PID" 2>/dev/null || true

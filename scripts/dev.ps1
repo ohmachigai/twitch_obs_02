@@ -4,6 +4,20 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path "$repoRoot/.."
 
+if (-not $env:APP_ENV) {
+    $env:APP_ENV = "development"
+}
+
+if (-not $env:DATABASE_URL) {
+    $dbPath = Join-Path $repoRoot "dev.db"
+    $escaped = $dbPath -replace '\\', '/'
+    $env:DATABASE_URL = "sqlite:///$escaped"
+}
+
+if (-not $env:WEBHOOK_SECRET) {
+    $env:WEBHOOK_SECRET = "dev-secret-change-me"
+}
+
 function Cleanup {
     param($processes)
     foreach ($process in $processes) {
