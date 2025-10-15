@@ -1,26 +1,70 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, StatusCode},
     response::{sse::Sse, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
+use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
+use twi_overlay_storage::Database;
 
 use crate::tap::{parse_stage_list, tap_keep_alive, tap_stream, TapFilter, TapHub};
-use crate::telemetry;
+use crate::{telemetry, webhook};
 
 #[derive(Clone)]
 pub struct AppState {
     metrics: PrometheusHandle,
     tap: TapHub,
+    storage: Database,
+    webhook_secret: Arc<[u8]>,
+    clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
 impl AppState {
-    pub fn new(metrics: PrometheusHandle, tap: TapHub) -> Self {
-        Self { metrics, tap }
+    pub fn new(
+        metrics: PrometheusHandle,
+        tap: TapHub,
+        storage: Database,
+        webhook_secret: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            metrics,
+            tap,
+            storage,
+            webhook_secret,
+            clock: Arc::new(Utc::now),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn metrics(&self) -> &PrometheusHandle {
+        &self.metrics
+    }
+
+    pub fn tap(&self) -> &TapHub {
+        &self.tap
+    }
+
+    pub fn storage(&self) -> &Database {
+        &self.storage
+    }
+
+    pub fn webhook_secret(&self) -> Arc<[u8]> {
+        self.webhook_secret.clone()
+    }
+
+    pub fn now(&self) -> DateTime<Utc> {
+        (self.clock)()
     }
 }
 
@@ -29,6 +73,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/_debug/tap", get(debug_tap))
+        .route("/eventsub/webhook", post(webhook::handle))
         .with_state(state)
 }
 
@@ -37,7 +82,7 @@ async fn healthz() -> StatusCode {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let body = telemetry::render_metrics(&state.metrics);
+    let body = telemetry::render_metrics(state.metrics());
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
@@ -60,7 +105,7 @@ async fn debug_tap(
 > {
     let stages = parse_stage_list(query.s).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let filter = TapFilter::from_stages(stages);
-    let stream = tap_stream(state.tap.clone(), filter);
+    let stream = tap_stream(state.tap().clone(), filter);
 
     Ok(Sse::new(stream).keep_alive(tap_keep_alive()))
 }
@@ -73,17 +118,24 @@ mod tests {
     use tokio::time::{self, Duration};
     use tower::ServiceExt;
 
-    use crate::{tap::StageEvent, telemetry};
+    use crate::tap::StageEvent;
 
-    fn setup_state() -> AppState {
+    async fn setup_state() -> AppState {
         let metrics = telemetry::init_metrics().expect("metrics init");
         let tap = TapHub::new();
-        AppState::new(metrics, tap)
+
+        let database = Database::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("connect");
+        database.run_migrations().await.expect("migrations");
+
+        let secret: Arc<[u8]> = Arc::from(b"test-secret".to_vec().into_boxed_slice());
+        AppState::new(metrics, tap, database, secret)
     }
 
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let app = app_router(setup_state());
+        let app = app_router(setup_state().await);
 
         let response = app
             .oneshot(
@@ -100,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_exports_build_info() {
-        let app = app_router(setup_state());
+        let app = app_router(setup_state().await);
 
         let response = app
             .oneshot(
@@ -125,8 +177,8 @@ mod tests {
 
     #[tokio::test]
     async fn tap_stream_emits_events() {
-        let state = setup_state();
-        let tap = state.tap.clone();
+        let state = setup_state().await;
+        let tap = state.tap().clone();
         let app = app_router(state);
 
         let request = Request::builder()

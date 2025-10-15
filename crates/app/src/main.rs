@@ -1,10 +1,12 @@
 mod router;
 mod tap;
 mod telemetry;
+mod webhook;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use tracing::info;
+use twi_overlay_storage::Database;
 use twi_overlay_util::{load_env_file, AppConfig};
 
 #[tokio::main]
@@ -20,7 +22,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tap_hub.spawn_mock_publisher();
     }
 
-    let state = router::AppState::new(metrics, tap_hub.clone());
+    let database = Database::connect(&config.database_url).await?;
+    database.run_migrations().await?;
+
+    let webhook_secret: Arc<[u8]> = Arc::from(
+        config
+            .webhook_secret
+            .clone()
+            .into_bytes()
+            .into_boxed_slice(),
+    );
+
+    let state = router::AppState::new(metrics, tap_hub.clone(), database, webhook_secret);
 
     let addr: SocketAddr = config.bind_addr;
     info!(stage = "app", %addr, env = %config.environment.as_str(), "starting HTTP server");

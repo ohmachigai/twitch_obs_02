@@ -1,4 +1,4 @@
-use metrics::describe_gauge;
+use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{
     BuildError as PrometheusBuildError, PrometheusBuilder, PrometheusHandle,
 };
@@ -122,6 +122,18 @@ pub fn init_metrics() -> Result<PrometheusHandle, TelemetryError> {
 
     describe_gauge!("app_build_info", "Build metadata for the running binary");
     describe_gauge!("app_uptime_seconds", "Seconds since the process started");
+    describe_counter!(
+        "eventsub_ingress_total",
+        "Count of EventSub webhook requests processed, labelled by message type"
+    );
+    describe_counter!(
+        "eventsub_invalid_signature_total",
+        "Count of EventSub webhook requests rejected due to invalid signatures"
+    );
+    describe_histogram!(
+        "webhook_ack_latency_seconds",
+        "Latency in seconds to acknowledge EventSub webhook requests"
+    );
     START_TIME.get_or_init(Instant::now);
 
     Ok(handle)

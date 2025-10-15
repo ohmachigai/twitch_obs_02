@@ -26,3 +26,11 @@ metrics-exporter-prometheus = "0.13"
 tokio-stream = { version = "0.1", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 http-body-util = "0.1"
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid", "migrate", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "1"
+tempfile = "3"
+hex = "0.4"

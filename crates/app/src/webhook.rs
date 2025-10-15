@@ -1,0 +1,699 @@
+use std::{borrow::Cow, sync::Arc, time::Instant};
+
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
+use metrics::{counter, histogram};
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+use tracing::{error, info, warn};
+use twi_overlay_storage::{EventRawError, EventRawInsertOutcome, NewEventRaw};
+use uuid::Uuid;
+
+use crate::router::AppState;
+use crate::tap::{StageEvent, StageKind, StageMetadata, StagePayload};
+
+const HEADER_MESSAGE_ID: &str = "Twitch-Eventsub-Message-Id";
+const HEADER_TIMESTAMP: &str = "Twitch-Eventsub-Message-Timestamp";
+const HEADER_SIGNATURE: &str = "Twitch-Eventsub-Message-Signature";
+const HEADER_MESSAGE_TYPE: &str = "Twitch-Eventsub-Message-Type";
+
+pub async fn handle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ProblemResponse> {
+    let start = Instant::now();
+    let message_type_value = get_required_header(&headers, HEADER_MESSAGE_TYPE)?;
+    let message_type_header = message_type_value.to_string();
+    let message_type = match MessageType::try_from(message_type_header.as_str()) {
+        Ok(mt) => mt,
+        Err(detail) => {
+            histogram!(
+                "webhook_ack_latency_seconds",
+                start.elapsed().as_secs_f64(),
+                "type" => "unknown"
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_message_type",
+                detail,
+            ));
+        }
+    };
+    let message_label = message_type.metric_label();
+
+    let message_id = get_required_header(&headers, HEADER_MESSAGE_ID)?;
+    let timestamp_raw = get_required_header(&headers, HEADER_TIMESTAMP)?;
+    let signature = get_required_header(&headers, HEADER_SIGNATURE)?;
+
+    let timestamp = parse_timestamp(timestamp_raw).map_err(|err| {
+        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        ProblemResponse::new(StatusCode::BAD_REQUEST, "invalid_timestamp", err)
+    })?;
+
+    let now = state.now();
+    let skew = now.signed_duration_since(timestamp).num_seconds().abs();
+    if skew > 600 {
+        warn!(
+            stage = "ingress",
+            %message_id,
+            %timestamp_raw,
+            now = %now.to_rfc3339(),
+            skew_seconds = skew,
+            "timestamp outside ±10 minute window"
+        );
+        histogram!(
+            "webhook_ack_latency_seconds",
+            start.elapsed().as_secs_f64(),
+            "type" => message_label
+        );
+        return Err(ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "timestamp_out_of_range",
+            "timestamp outside the allowed ±10 minute window",
+        ));
+    }
+
+    let secret = state.webhook_secret();
+    verify_signature(&secret, message_id, timestamp_raw, &body, signature).map_err(|err| {
+        counter!("eventsub_invalid_signature_total", 1, "type" => message_label);
+        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        ProblemResponse::new(StatusCode::FORBIDDEN, "invalid_signature", err)
+    })?;
+
+    counter!("eventsub_ingress_total", 1, "type" => message_label);
+
+    let body_len = body.len() as u64;
+    let body_string = String::from_utf8(body.to_vec()).map_err(|_| {
+        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        ProblemResponse::new(StatusCode::BAD_REQUEST, "invalid_payload", "request body must be valid UTF-8")
+    })?;
+    let json_value: Value = serde_json::from_str(&body_string).map_err(|err| {
+        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            format!("failed to parse payload: {err}"),
+        )
+    })?;
+
+    let response = match message_type {
+        MessageType::Verification => {
+            let subscription = json_value.get("subscription");
+            let event_type = subscription
+                .and_then(|sub| sub.get("type").and_then(Value::as_str))
+                .unwrap_or(message_label);
+            let broadcaster = subscription
+                .and_then(|sub| sub.get("condition"))
+                .and_then(Value::as_object)
+                .and_then(|cond| cond.get("broadcaster_user_id"))
+                .and_then(Value::as_str);
+
+            let challenge = json_value
+                .get("challenge")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    histogram!(
+                        "webhook_ack_latency_seconds",
+                        start.elapsed().as_secs_f64(),
+                        "type" => message_label
+                    );
+                    ProblemResponse::new(
+                        StatusCode::BAD_REQUEST,
+                        "missing_challenge",
+                        "verification payload must include challenge",
+                    )
+                })?;
+
+            emit_tap(TapPublish {
+                state: &state,
+                message_id,
+                broadcaster_id: broadcaster,
+                event_type,
+                message_label,
+                body_len,
+                elapsed_secs: start.elapsed().as_secs_f64(),
+                received_at: state.now(),
+                duplicate: false,
+                status: StatusCode::OK,
+            });
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "text/plain")
+                .body(challenge.to_string().into())
+                .unwrap();
+            histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+            return Ok(response);
+        }
+        MessageType::Notification | MessageType::Revocation => {
+            match handle_persisted_message(
+                &state,
+                &json_value,
+                &body_string,
+                message_id,
+                timestamp,
+                message_label,
+                start,
+            )
+            .await
+            {
+                Ok(response) => {
+                    histogram!(
+                        "webhook_ack_latency_seconds",
+                        start.elapsed().as_secs_f64(),
+                        "type" => message_label
+                    );
+                    response
+                }
+                Err(err) => {
+                    histogram!(
+                        "webhook_ack_latency_seconds",
+                        start.elapsed().as_secs_f64(),
+                        "type" => message_label
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    };
+
+    Ok(response)
+}
+
+async fn handle_persisted_message(
+    state: &AppState,
+    json_value: &Value,
+    body_string: &str,
+    message_id: &str,
+    timestamp: DateTime<Utc>,
+    message_label: &'static str,
+    start: Instant,
+) -> Result<Response, ProblemResponse> {
+    let subscription = json_value.get("subscription").ok_or_else(|| {
+        ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "missing_subscription",
+            "payload missing subscription block",
+        )
+    })?;
+    let event_type = subscription
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "missing_event_type",
+                "subscription.type is required",
+            )
+        })?;
+
+    let broadcaster_id = subscription
+        .get("condition")
+        .and_then(Value::as_object)
+        .and_then(|cond| cond.get("broadcaster_user_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            json_value
+                .get("event")
+                .and_then(|event| event.get("broadcaster_user_id"))
+                .and_then(Value::as_str)
+        })
+        .ok_or_else(|| {
+            ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "missing_broadcaster",
+                "unable to resolve broadcaster id from payload",
+            )
+        })?;
+
+    let repo = state.storage().event_raw();
+    let received_at = state.now();
+    let record = NewEventRaw {
+        id: Cow::Owned(Uuid::new_v4().to_string()),
+        broadcaster_id: Cow::Borrowed(broadcaster_id),
+        msg_id: Cow::Borrowed(message_id),
+        event_type: Cow::Borrowed(event_type),
+        payload_json: Cow::Borrowed(body_string),
+        event_at: timestamp,
+        received_at,
+        source: "webhook",
+    };
+
+    let insert_outcome = repo.insert(record).await.map_err(|err| match err {
+        EventRawError::MissingBroadcaster => {
+            error!(stage = "ingress", %message_id, broadcaster_id, "broadcaster missing in database");
+            ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing_broadcaster",
+                "broadcaster is not provisioned for webhook ingress",
+            )
+        }
+        EventRawError::Database(db_err) => {
+            error!(stage = "ingress", %message_id, error = %db_err, "failed to persist event raw");
+            ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "failed to persist webhook payload",
+            )
+        }
+    })?;
+
+    let duplicate = matches!(insert_outcome, EventRawInsertOutcome::Duplicate);
+    if duplicate {
+        info!(stage = "ingress", %message_id, broadcaster_id, "duplicate webhook message skipped");
+    }
+
+    emit_tap(TapPublish {
+        state,
+        message_id,
+        broadcaster_id: Some(broadcaster_id),
+        event_type,
+        message_label,
+        body_len: body_string.len() as u64,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+        received_at,
+        duplicate,
+        status: StatusCode::NO_CONTENT,
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(axum::body::Body::empty())
+        .unwrap())
+}
+
+struct TapPublish<'a> {
+    state: &'a AppState,
+    message_id: &'a str,
+    broadcaster_id: Option<&'a str>,
+    event_type: &'a str,
+    message_label: &'static str,
+    body_len: u64,
+    elapsed_secs: f64,
+    received_at: DateTime<Utc>,
+    duplicate: bool,
+    status: StatusCode,
+}
+
+fn emit_tap(ctx: TapPublish<'_>) {
+    let meta = StageMetadata {
+        msg_id: Some(ctx.message_id.to_string()),
+        event_type: Some(ctx.event_type.to_string()),
+        size_bytes: Some(ctx.body_len),
+        latency_ms: Some(ctx.elapsed_secs * 1000.0),
+        ..StageMetadata::default()
+    };
+
+    let event = StageEvent {
+        ts: ctx.received_at,
+        stage: StageKind::Ingress,
+        trace_id: None,
+        op_id: None,
+        version: None,
+        broadcaster_id: ctx.broadcaster_id.map(|id| id.to_string()),
+        meta,
+        r#in: StagePayload {
+            redacted: true,
+            payload: Value::Null,
+            truncated: None,
+        },
+        out: StagePayload {
+            redacted: false,
+            payload: json!({
+                "status": ctx.status.as_u16(),
+                "type": ctx.message_label,
+                "duplicate": ctx.duplicate,
+            }),
+            truncated: None,
+        },
+    };
+
+    ctx.state.tap().publish(event);
+}
+fn get_required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, ProblemResponse> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "missing_header",
+                format!("missing header {name}"),
+            )
+        })
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|err| format!("invalid RFC3339 timestamp: {err}"))
+}
+
+fn verify_signature(
+    secret: &Arc<[u8]>,
+    message_id: &str,
+    timestamp: &str,
+    body: &[u8],
+    provided: &str,
+) -> Result<(), String> {
+    let hex_part = provided
+        .strip_prefix("sha256=")
+        .ok_or_else(|| "signature must start with 'sha256='".to_string())?;
+    let provided_bytes =
+        hex::decode(hex_part).map_err(|_| "signature is not valid hex".to_string())?;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
+        .map_err(|_| "failed to initialize signature verifier".to_string())?;
+    mac.update(message_id.as_bytes());
+    mac.update(timestamp.as_bytes());
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+    let expected_bytes: &[u8] = expected.as_ref();
+
+    if expected_bytes.ct_eq(provided_bytes.as_slice()).into() {
+        Ok(())
+    } else {
+        Err("signature mismatch".to_string())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProblemDetails {
+    #[serde(rename = "type")]
+    problem_type: &'static str,
+    title: &'static str,
+    detail: String,
+}
+
+pub struct ProblemResponse {
+    status: StatusCode,
+    body: ProblemDetails,
+}
+
+impl ProblemResponse {
+    pub fn new<S: Into<String>>(status: StatusCode, problem_type: &'static str, detail: S) -> Self {
+        Self {
+            status,
+            body: ProblemDetails {
+                problem_type,
+                title: status.canonical_reason().unwrap_or("error"),
+                detail: detail.into(),
+            },
+        }
+    }
+}
+
+impl IntoResponse for ProblemResponse {
+    fn into_response(self) -> Response {
+        let mut response = axum::Json(self.body).into_response();
+        *response.status_mut() = self.status;
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/problem+json"),
+        );
+        response
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MessageType {
+    Verification,
+    Notification,
+    Revocation,
+}
+
+impl TryFrom<&str> for MessageType {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "webhook_callback_verification" => Ok(Self::Verification),
+            "notification" => Ok(Self::Notification),
+            "revocation" => Ok(Self::Revocation),
+            other => Err(format!("unsupported message type: {other}")),
+        }
+    }
+}
+
+impl MessageType {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Verification => "verification",
+            Self::Notification => "notification",
+            Self::Revocation => "revocation",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderValue, Method, Request, StatusCode},
+    };
+    use chrono::{Duration, SecondsFormat};
+    use http_body_util::BodyExt;
+    use sqlx::{query, query_scalar, Row};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    use crate::{router::app_router, telemetry};
+    use twi_overlay_storage::Database;
+
+    const BROADCASTER_ID: &str = "b-123";
+    const FIXED_NOW: &str = "2024-01-01T00:00:00Z";
+
+    struct TestContext {
+        state: AppState,
+        database: Database,
+        secret: String,
+        now: DateTime<Utc>,
+    }
+
+    async fn setup_context() -> TestContext {
+        let metrics = telemetry::init_metrics().expect("metrics init");
+        let tap = crate::tap::TapHub::new();
+        let database = Database::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("connect");
+        database.run_migrations().await.expect("migrations");
+
+        let now = DateTime::parse_from_rfc3339(FIXED_NOW)
+            .expect("fixed time")
+            .with_timezone(&Utc);
+
+        query(
+            "INSERT INTO broadcasters (id, twitch_broadcaster_id, display_name, timezone, settings_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(BROADCASTER_ID)
+        .bind("twitch-".to_string() + BROADCASTER_ID)
+        .bind("Test Broadcaster")
+        .bind("UTC")
+        .bind("{}")
+        .bind(now.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .bind(now.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .execute(database.pool())
+        .await
+        .expect("insert broadcaster");
+
+        let secret = "test-secret".to_string();
+        let secret_arc: Arc<[u8]> = Arc::from(secret.clone().into_bytes().into_boxed_slice());
+        let fixed_now = now;
+        let clock = Arc::new(move || fixed_now);
+        let state = AppState::new(metrics, tap, database.clone(), secret_arc).with_clock(clock);
+
+        TestContext {
+            state,
+            database,
+            secret,
+            now,
+        }
+    }
+
+    fn sign(secret: &str, message_id: &str, timestamp: &str, body: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac");
+        mac.update(message_id.as_bytes());
+        mac.update(timestamp.as_bytes());
+        mac.update(body.as_bytes());
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn headers(
+        message_type: &str,
+        message_id: &str,
+        timestamp: &str,
+        signature: &str,
+    ) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_MESSAGE_TYPE,
+            HeaderValue::from_str(message_type).expect("type header"),
+        );
+        headers.insert(
+            HEADER_MESSAGE_ID,
+            HeaderValue::from_str(message_id).expect("id header"),
+        );
+        headers.insert(
+            HEADER_TIMESTAMP,
+            HeaderValue::from_str(timestamp).expect("timestamp header"),
+        );
+        headers.insert(
+            HEADER_SIGNATURE,
+            HeaderValue::from_str(signature).expect("signature header"),
+        );
+        headers
+    }
+
+    async fn call_webhook(state: AppState, headers: HeaderMap, body: String) -> Response {
+        let mut request_headers = headers;
+        request_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/eventsub/webhook")
+            .body(Body::from(body))
+            .expect("request");
+        *request.headers_mut() = request_headers;
+
+        let app = app_router(state);
+        app.oneshot(request).await.expect("response")
+    }
+
+    fn notification_body() -> String {
+        serde_json::json!({
+            "subscription": {
+                "type": "channel.channel_points_custom_reward_redemption.add",
+                "version": "1",
+                "condition": {"broadcaster_user_id": BROADCASTER_ID}
+            },
+            "event": {
+                "broadcaster_user_id": BROADCASTER_ID,
+                "id": "event-1"
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn verification_returns_challenge() {
+        let ctx = setup_context().await;
+        let body = serde_json::json!({
+            "challenge": "TEST",
+            "subscription": {
+                "type": "channel.channel_points_custom_reward_redemption.add",
+                "condition": {"broadcaster_user_id": BROADCASTER_ID},
+                "version": "1"
+            }
+        })
+        .to_string();
+
+        let timestamp = ctx.now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let signature = sign(&ctx.secret, "msg-verification", &timestamp, &body);
+        let headers = headers(
+            "webhook_callback_verification",
+            "msg-verification",
+            &timestamp,
+            &signature,
+        );
+
+        let response = call_webhook(ctx.state.clone(), headers, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response.into_body().collect().await.expect("body");
+        assert_eq!(body_bytes.to_bytes(), &b"TEST"[..]);
+
+        let count: i64 = query_scalar("SELECT COUNT(*) FROM event_raw")
+            .fetch_one(ctx.database.pool())
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn notification_persists_payload_and_emits_tap() {
+        let ctx = setup_context().await;
+        let body = notification_body();
+        let timestamp = ctx.now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let message_id = "msg-1";
+        let signature = sign(&ctx.secret, message_id, &timestamp, &body);
+        let headers = headers("notification", message_id, &timestamp, &signature);
+        let tap = ctx.state.tap().clone();
+        let mut receiver = tap.subscribe();
+
+        let response = call_webhook(ctx.state.clone(), headers, body.clone()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let record = query("SELECT msg_id, type, payload_json FROM event_raw")
+            .fetch_one(ctx.database.pool())
+            .await
+            .expect("record");
+        assert_eq!(record.get::<String, _>("msg_id"), message_id);
+        assert!(record
+            .get::<String, _>("payload_json")
+            .contains("channel.channel_points_custom_reward_redemption.add"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), receiver.recv())
+            .await
+            .expect("tap event available")
+            .expect("event value");
+        assert_eq!(event.stage, StageKind::Ingress);
+        assert_eq!(event.meta.msg_id.as_deref(), Some(message_id));
+    }
+
+    #[tokio::test]
+    async fn duplicate_notification_is_idempotent() {
+        let ctx = setup_context().await;
+        let body = notification_body();
+        let timestamp = ctx.now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let message_id = "msg-dup";
+        let signature = sign(&ctx.secret, message_id, &timestamp, &body);
+        let headers = headers("notification", message_id, &timestamp, &signature);
+
+        let response = call_webhook(ctx.state.clone(), headers.clone(), body.clone()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = call_webhook(ctx.state.clone(), headers, body).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let count: i64 = query_scalar("SELECT COUNT(*) FROM event_raw")
+            .fetch_one(ctx.database.pool())
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_signature() {
+        let ctx = setup_context().await;
+        let body = notification_body();
+        let timestamp = ctx.now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let headers = headers("notification", "msg-bad", &timestamp, "sha256=deadbeef");
+
+        let response = call_webhook(ctx.state.clone(), headers, body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rejects_timestamp_outside_window() {
+        let ctx = setup_context().await;
+        let body = notification_body();
+        let timestamp =
+            (ctx.now - Duration::minutes(11)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let signature = sign(&ctx.secret, "msg-skew", &timestamp, &body);
+        let headers = headers("notification", "msg-skew", &timestamp, &signature);
+
+        let response = call_webhook(ctx.state.clone(), headers, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
