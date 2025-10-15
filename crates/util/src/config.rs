@@ -110,14 +110,12 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DEFAULT_BIND_ADDR;
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    use crate::{test_support, DEFAULT_BIND_ADDR};
+    use std::env;
 
     #[test]
     fn loads_defaults_in_development() {
-        let _guard = ENV_GUARD.lock().expect("env guard poisoned");
+        let _guard = test_support::env_vars_lock();
         env::remove_var("APP_ENV");
         env::remove_var("APP_BIND_ADDR");
         env::remove_var("DATABASE_URL");
@@ -132,7 +130,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_environment() {
-        let _guard = ENV_GUARD.lock().expect("env guard poisoned");
+        let _guard = test_support::env_vars_lock();
         env::set_var("APP_ENV", "invalid");
 
         let err = AppConfig::from_env().expect_err("invalid env should error");
@@ -143,7 +141,7 @@ mod tests {
 
     #[test]
     fn parses_production_environment() {
-        let _guard = ENV_GUARD.lock().expect("env guard poisoned");
+        let _guard = test_support::env_vars_lock();
         env::set_var("APP_ENV", "production");
         env::set_var("APP_BIND_ADDR", "0.0.0.0:9000");
         env::set_var("DATABASE_URL", "sqlite:///var/app.db");
@@ -163,7 +161,7 @@ mod tests {
 
     #[test]
     fn production_requires_webhook_secret() {
-        let _guard = ENV_GUARD.lock().expect("env guard poisoned");
+        let _guard = test_support::env_vars_lock();
         env::set_var("APP_ENV", "production");
         env::remove_var("WEBHOOK_SECRET");
 
