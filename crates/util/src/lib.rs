@@ -1,4 +1,8 @@
+pub mod config;
+
 use std::{env, net::SocketAddr};
+
+pub use config::{AppConfig, ConfigError, Environment};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 

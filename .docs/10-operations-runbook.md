@@ -13,6 +13,7 @@
 * **dev**：ローカル開発。Nginx 不要。HTTP 直結。
 * **stg**（任意）：本番相当の疎通確認。
 * **prod**：**HTTPS（TLS）+ Nginx** で公開。**ポート 443 必須**（EventSub Webhook）。
+  * `.env` の `APP_ENV` は `production` を指定する（ロギング JSON / Tap モック停止）。
 
 ### 1.2 前提（VPS 512 MB〜1 GB）
 
@@ -63,6 +64,7 @@
 `/etc/twi-overlay/env`（0600, 所有 `overlay:overlay`）
 
 ```dotenv
+APP_ENV=production
 APP_BASE_URL=https://overlay.example.com
 RUST_LOG=info
 
