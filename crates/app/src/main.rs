@@ -1,9 +1,11 @@
+mod command;
 mod router;
+mod sse;
 mod tap;
 mod telemetry;
 mod webhook;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tracing::info;
 use twi_overlay_storage::Database;
@@ -33,7 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_boxed_slice(),
     );
 
-    let state = router::AppState::new(metrics, tap_hub.clone(), database, webhook_secret);
+    let state = router::AppState::new(
+        metrics,
+        tap_hub.clone(),
+        database,
+        webhook_secret,
+        config.sse_token_signing_key.clone(),
+        config.sse_ring_max,
+        Duration::from_secs(config.sse_ring_ttl_secs),
+        config.sse_heartbeat_secs,
+    );
 
     let addr: SocketAddr = config.bind_addr;
     info!(stage = "app", %addr, env = %config.environment.as_str(), "starting HTTP server");

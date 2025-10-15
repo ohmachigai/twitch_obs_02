@@ -15,8 +15,10 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 use twi_overlay_core::normalizer::{Normalizer, NormalizerError};
-use twi_overlay_core::types::{NormalizedEvent, Settings};
-use twi_overlay_storage::{EventRawError, EventRawInsertOutcome, NewEventRaw, SettingsError};
+use twi_overlay_core::types::{Command, NormalizedEvent, Patch, Settings};
+use twi_overlay_storage::{
+    BroadcasterSettings, EventRawError, EventRawInsertOutcome, NewEventRaw, SettingsError,
+};
 use uuid::Uuid;
 
 use crate::router::AppState;
@@ -325,7 +327,7 @@ async fn process_pipeline(
         Err(_) => return,
     };
 
-    let settings = match state
+    let profile = match state
         .storage()
         .broadcasters()
         .fetch_settings(broadcaster_id)
@@ -338,7 +340,18 @@ async fn process_pipeline(
         }
     };
 
-    evaluate_policy(state, broadcaster_id, &normalized, &settings);
+    let outcome = evaluate_policy(state, broadcaster_id, &normalized, &profile.settings);
+
+    if !outcome.commands.is_empty() {
+        dispatch_commands(
+            state,
+            broadcaster_id,
+            &profile,
+            &outcome.commands,
+            &normalized,
+        )
+        .await;
+    }
 }
 
 fn normalize_payload(
@@ -480,7 +493,7 @@ fn evaluate_policy(
     broadcaster_id: &str,
     normalized: &NormalizedEvent,
     settings: &Settings,
-) {
+) -> twi_overlay_core::policy::PolicyOutcome {
     let issued_at = state.now();
     let start = Instant::now();
     let outcome = state.policy().evaluate(settings, normalized, issued_at);
@@ -518,6 +531,7 @@ fn evaluate_policy(
     for command in &outcome.commands {
         counter!("policy_commands_total", 1, "kind" => command.metric_kind());
     }
+    outcome
 }
 
 fn emit_policy_error(
@@ -553,6 +567,78 @@ fn emit_policy_error(
         out: StagePayload {
             redacted: true,
             payload: json!({ "error": err.to_string() }),
+            truncated: None,
+        },
+    };
+    state.tap().publish(event);
+}
+
+async fn dispatch_commands(
+    state: &AppState,
+    broadcaster_id: &str,
+    profile: &BroadcasterSettings,
+    commands: &[Command],
+    normalized: &NormalizedEvent,
+) {
+    match state
+        .command_executor()
+        .execute(broadcaster_id, &profile.timezone, commands)
+        .await
+    {
+        Ok(patches) => {
+            for patch in patches {
+                if let Err(err) = state
+                    .sse()
+                    .broadcast_patch(broadcaster_id, &patch, state.now())
+                    .await
+                {
+                    error!(
+                        stage = "sse",
+                        broadcaster_id,
+                        error = %err,
+                        "failed to broadcast patch"
+                    );
+                    continue;
+                }
+                emit_sse_stage(state, broadcaster_id, &patch);
+            }
+        }
+        Err(err) => {
+            error!(
+                stage = "command",
+                broadcaster_id,
+                error = %err,
+                event_type = normalized.event_type(),
+                "failed to execute commands"
+            );
+        }
+    }
+}
+
+fn emit_sse_stage(state: &AppState, broadcaster_id: &str, patch: &Patch) {
+    let latency = state
+        .now()
+        .signed_duration_since(patch.at)
+        .num_milliseconds() as f64;
+    let event = StageEvent {
+        ts: state.now(),
+        stage: StageKind::Sse,
+        trace_id: None,
+        op_id: None,
+        version: Some(patch.version),
+        broadcaster_id: Some(broadcaster_id.to_string()),
+        meta: StageMetadata {
+            message: Some(patch.kind_str().to_string()),
+            latency_ms: Some(latency),
+            ..StageMetadata::default()
+        },
+        r#in: StagePayload::default(),
+        out: StagePayload {
+            redacted: true,
+            payload: json!({
+                "type": patch.kind_str(),
+                "version": patch.version,
+            }),
             truncated: None,
         },
     };
@@ -766,6 +852,7 @@ mod tests {
     use http_body_util::BodyExt;
     use sqlx::{query, query_scalar, Row};
     use std::sync::Arc;
+    use std::time::Duration as StdDuration;
     use tower::ServiceExt;
 
     use crate::{router::app_router, telemetry};
@@ -826,7 +913,17 @@ mod tests {
         let secret_arc: Arc<[u8]> = Arc::from(secret.clone().into_bytes().into_boxed_slice());
         let fixed_now = now;
         let clock = Arc::new(move || fixed_now);
-        let state = AppState::new(metrics, tap, database.clone(), secret_arc).with_clock(clock);
+        let state = AppState::new(
+            metrics,
+            tap,
+            database.clone(),
+            secret_arc,
+            b"token-secret".to_vec(),
+            64,
+            StdDuration::from_secs(60),
+            25,
+        )
+        .with_clock(clock);
 
         TestContext {
             state,
