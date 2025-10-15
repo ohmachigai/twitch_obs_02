@@ -1,8 +1,10 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
+use std::str::FromStr;
 
 /// Application settings persisted for a broadcaster.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -17,6 +19,47 @@ pub struct Settings {
     pub clear_decrement_counts: bool,
     #[serde(default)]
     pub policy: PolicySettings,
+}
+
+/// Representation of a queue entry persisted for a broadcaster.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueEntry {
+    pub id: String,
+    pub broadcaster_id: String,
+    pub user_id: String,
+    pub user_login: String,
+    pub user_display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_avatar: Option<String>,
+    pub reward_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redemption_id: Option<String>,
+    pub enqueued_at: DateTime<Utc>,
+    pub status: QueueEntryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    pub managed: bool,
+    pub last_updated_at: DateTime<Utc>,
+}
+
+/// Queue entry status persisted in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueueEntryStatus {
+    Queued,
+    Completed,
+    Removed,
+}
+
+impl QueueEntryStatus {
+    /// Returns the canonical database representation for the status.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Completed => "COMPLETED",
+            Self::Removed => "REMOVED",
+        }
+    }
 }
 
 fn default_overlay_theme() -> String {
@@ -350,4 +393,99 @@ pub enum CommandResult {
     Ok,
     Failed,
     Skipped,
+}
+
+/// Aggregated state used when emitting `state.replace` patches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub version: u64,
+    pub queue: Vec<QueueEntry>,
+    pub counters_today: Vec<UserCounter>,
+    pub settings: Settings,
+}
+
+/// Daily counter value for a user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserCounter {
+    pub user_id: String,
+    pub count: u32,
+}
+
+/// Patch emitted through SSE channels representing a state change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Patch {
+    pub version: u64,
+    #[serde(rename = "type")]
+    pub kind: PatchKind,
+    pub at: DateTime<Utc>,
+    pub data: Value,
+}
+
+impl Patch {
+    /// Returns the patch type string.
+    pub fn kind_str(&self) -> &'static str {
+        self.kind.as_str()
+    }
+}
+
+/// Enumerates the supported patch kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchKind {
+    QueueEnqueued,
+    QueueRemoved,
+    QueueCompleted,
+    CounterUpdated,
+    SettingsUpdated,
+    RedemptionUpdated,
+    StateReplace,
+}
+
+impl PatchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueEnqueued => "queue.enqueued",
+            Self::QueueRemoved => "queue.removed",
+            Self::QueueCompleted => "queue.completed",
+            Self::CounterUpdated => "counter.updated",
+            Self::SettingsUpdated => "settings.updated",
+            Self::RedemptionUpdated => "redemption.updated",
+            Self::StateReplace => "state.replace",
+        }
+    }
+}
+
+impl Serialize for PatchKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PatchKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        PatchKind::from_str(&value).map_err(|_| D::Error::custom("unknown patch kind"))
+    }
+}
+
+impl FromStr for PatchKind {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "queue.enqueued" => Ok(Self::QueueEnqueued),
+            "queue.removed" => Ok(Self::QueueRemoved),
+            "queue.completed" => Ok(Self::QueueCompleted),
+            "counter.updated" => Ok(Self::CounterUpdated),
+            "settings.updated" => Ok(Self::SettingsUpdated),
+            "redemption.updated" => Ok(Self::RedemptionUpdated),
+            "state.replace" => Ok(Self::StateReplace),
+            _ => Err(()),
+        }
+    }
 }
