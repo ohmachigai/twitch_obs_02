@@ -350,6 +350,8 @@ find /var/lib/twi-overlay/data/backup -type f -mtime +14 -delete
 ### 16.3 TTL / checkpoint を即時実行（手動トリガ）
 
 * 管理 UI から「メンテ」ボタン、またはアプリの管理エンドポイント（実装時）。
+* Tap `stage="storage"` に `ttl.event_raw` / `ttl.command_log` / `wal.checkpoint` が流れ、`deleted` / `busy` / `duration_secs` が更新されることを確認（MUST）。
+* `/metrics` で `db_ttl_deleted_total{table}`、`db_busy_total{op}`、`db_checkpoint_seconds` のカウンタ/ヒストグラムが前回値から増えることを確認。
 
 ---
 

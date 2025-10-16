@@ -175,11 +175,7 @@ impl SseHub {
     ) -> Result<(), SseError> {
         let message = Arc::new(SseMessage::from_patch(patch)?);
         let latency = now.signed_duration_since(patch.at).num_milliseconds() as f64 / 1000.0;
-        histogram!(
-            "sse_broadcast_latency_seconds",
-            latency,
-            "type" => patch.kind_str()
-        );
+        histogram!("sse_broadcast_latency_seconds", "type" => patch.kind_str()).record(latency);
 
         for audience in [Audience::Overlay, Audience::Admin] {
             let channel = self.ensure_channel(broadcaster_id, audience).await;
@@ -222,7 +218,7 @@ impl SseHub {
             .map(|first| since_version.map(|v| v < first.version).unwrap_or(false))
             .unwrap_or(false);
         if ring_miss {
-            counter!("sse_ring_miss_total", 1, "aud" => audience.as_str());
+            counter!("sse_ring_miss_total", "aud" => audience.as_str()).increment(1);
         }
 
         let backlog = if ring_miss {
@@ -424,7 +420,7 @@ impl ClientCounters {
             Audience::Overlay => self.overlay.fetch_add(1, Ordering::SeqCst) + 1,
             Audience::Admin => self.admin.fetch_add(1, Ordering::SeqCst) + 1,
         };
-        gauge!("sse_clients", value as f64, "aud" => audience.as_str());
+        gauge!("sse_clients", "aud" => audience.as_str()).set(value as f64);
     }
 
     fn decrement(&self, audience: Audience) {
@@ -435,7 +431,7 @@ impl ClientCounters {
                 .saturating_sub(1),
             Audience::Admin => self.admin.fetch_sub(1, Ordering::SeqCst).saturating_sub(1),
         };
-        gauge!("sse_clients", value as f64, "aud" => audience.as_str());
+        gauge!("sse_clients", "aud" => audience.as_str()).set(value as f64);
     }
 }
 

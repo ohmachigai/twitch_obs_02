@@ -1,4 +1,5 @@
 mod command;
+mod maintenance;
 mod problem;
 mod router;
 mod sse;
@@ -28,6 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database = Database::connect(&config.database_url).await?;
     database.run_migrations().await?;
+
+    let _maintenance_handle =
+        maintenance::MaintenanceWorker::new(database.clone(), tap_hub.clone()).spawn();
 
     let webhook_secret: Arc<[u8]> = Arc::from(
         config

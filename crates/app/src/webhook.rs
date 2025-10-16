@@ -40,11 +40,8 @@ pub async fn handle(
     let message_type = match MessageType::try_from(message_type_header.as_str()) {
         Ok(mt) => mt,
         Err(detail) => {
-            histogram!(
-                "webhook_ack_latency_seconds",
-                start.elapsed().as_secs_f64(),
-                "type" => "unknown"
-            );
+            histogram!("webhook_ack_latency_seconds", "type" => "unknown")
+                .record(start.elapsed().as_secs_f64());
             return Err(ProblemResponse::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_message_type",
@@ -59,7 +56,8 @@ pub async fn handle(
     let signature = get_required_header(&headers, HEADER_SIGNATURE)?;
 
     let timestamp = parse_timestamp(timestamp_raw).map_err(|err| {
-        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        histogram!("webhook_ack_latency_seconds", "type" => message_label)
+            .record(start.elapsed().as_secs_f64());
         ProblemResponse::new(StatusCode::BAD_REQUEST, "invalid_timestamp", err)
     })?;
 
@@ -74,11 +72,8 @@ pub async fn handle(
             skew_seconds = skew,
             "timestamp outside ±10 minute window"
         );
-        histogram!(
-            "webhook_ack_latency_seconds",
-            start.elapsed().as_secs_f64(),
-            "type" => message_label
-        );
+        histogram!("webhook_ack_latency_seconds", "type" => message_label)
+            .record(start.elapsed().as_secs_f64());
         return Err(ProblemResponse::new(
             StatusCode::BAD_REQUEST,
             "timestamp_out_of_range",
@@ -88,20 +83,27 @@ pub async fn handle(
 
     let secret = state.webhook_secret();
     verify_signature(&secret, message_id, timestamp_raw, &body, signature).map_err(|err| {
-        counter!("eventsub_invalid_signature_total", 1, "type" => message_label);
-        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        counter!("eventsub_invalid_signature_total", "type" => message_label).increment(1);
+        histogram!("webhook_ack_latency_seconds", "type" => message_label)
+            .record(start.elapsed().as_secs_f64());
         ProblemResponse::new(StatusCode::FORBIDDEN, "invalid_signature", err)
     })?;
 
-    counter!("eventsub_ingress_total", 1, "type" => message_label);
+    counter!("eventsub_ingress_total", "type" => message_label).increment(1);
 
     let body_len = body.len() as u64;
     let body_string = String::from_utf8(body.to_vec()).map_err(|_| {
-        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
-        ProblemResponse::new(StatusCode::BAD_REQUEST, "invalid_payload", "request body must be valid UTF-8")
+        histogram!("webhook_ack_latency_seconds", "type" => message_label)
+            .record(start.elapsed().as_secs_f64());
+        ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_payload",
+            "request body must be valid UTF-8",
+        )
     })?;
     let json_value: Value = serde_json::from_str(&body_string).map_err(|err| {
-        histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+        histogram!("webhook_ack_latency_seconds", "type" => message_label)
+            .record(start.elapsed().as_secs_f64());
         ProblemResponse::new(
             StatusCode::BAD_REQUEST,
             "invalid_json",
@@ -125,11 +127,8 @@ pub async fn handle(
                 .get("challenge")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    histogram!(
-                        "webhook_ack_latency_seconds",
-                        start.elapsed().as_secs_f64(),
-                        "type" => message_label
-                    );
+                    histogram!("webhook_ack_latency_seconds", "type" => message_label)
+                        .record(start.elapsed().as_secs_f64());
                     ProblemResponse::new(
                         StatusCode::BAD_REQUEST,
                         "missing_challenge",
@@ -155,7 +154,8 @@ pub async fn handle(
                 .header(axum::http::header::CONTENT_TYPE, "text/plain")
                 .body(challenge.to_string().into())
                 .unwrap();
-            histogram!("webhook_ack_latency_seconds", start.elapsed().as_secs_f64(), "type" => message_label);
+            histogram!("webhook_ack_latency_seconds", "type" => message_label)
+                .record(start.elapsed().as_secs_f64());
             return Ok(response);
         }
         MessageType::Notification | MessageType::Revocation => {
@@ -171,19 +171,13 @@ pub async fn handle(
             .await
             {
                 Ok(response) => {
-                    histogram!(
-                        "webhook_ack_latency_seconds",
-                        start.elapsed().as_secs_f64(),
-                        "type" => message_label
-                    );
+                    histogram!("webhook_ack_latency_seconds", "type" => message_label)
+                        .record(start.elapsed().as_secs_f64());
                     response
                 }
                 Err(err) => {
-                    histogram!(
-                        "webhook_ack_latency_seconds",
-                        start.elapsed().as_secs_f64(),
-                        "type" => message_label
-                    );
+                    histogram!("webhook_ack_latency_seconds", "type" => message_label)
+                        .record(start.elapsed().as_secs_f64());
                     return Err(err);
                 }
             }
@@ -529,7 +523,7 @@ fn evaluate_policy(
     state.tap().publish(event);
 
     for command in &outcome.commands {
-        counter!("policy_commands_total", 1, "kind" => command.metric_kind());
+        counter!("policy_commands_total", "kind" => command.metric_kind()).increment(1);
     }
     outcome
 }

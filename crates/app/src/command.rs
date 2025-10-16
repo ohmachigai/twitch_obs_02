@@ -272,7 +272,7 @@ impl CommandExecutor {
 
         let patch = Projector::queue_enqueued(version, command.issued_at, entry, user_today_count);
         self.emit_projector_event(broadcaster_id, version, &patch, &command_enum, None);
-        counter!("projector_patches_total", 1, "type" => patch.kind_str());
+        counter!("projector_patches_total", "type" => patch.kind_str()).increment(1);
 
         Ok(CommandApplication {
             version,
@@ -312,7 +312,7 @@ impl CommandExecutor {
 
         let patch = Projector::redemption_updated(version, command.issued_at, command);
         self.emit_projector_event(broadcaster_id, version, &patch, &command_enum, None);
-        counter!("projector_patches_total", 1, "type" => patch.kind_str());
+        counter!("projector_patches_total", "type" => patch.kind_str()).increment(1);
 
         Ok(CommandApplication {
             version,
@@ -401,7 +401,7 @@ impl CommandExecutor {
             &command_enum,
             Some(&command.op_id),
         );
-        counter!("projector_patches_total", 1, "type" => patch.kind_str());
+        counter!("projector_patches_total", "type" => patch.kind_str()).increment(1);
 
         Ok(CommandApplication {
             version,
@@ -518,7 +518,7 @@ impl CommandExecutor {
             &command_enum,
             Some(&command.op_id),
         );
-        counter!("projector_patches_total", 1, "type" => queue_patch.kind_str());
+        counter!("projector_patches_total", "type" => queue_patch.kind_str()).increment(1);
         patches.push(queue_patch);
 
         if matches!(command.reason, QueueRemovalReason::Undo) {
@@ -531,7 +531,7 @@ impl CommandExecutor {
                 &command_enum,
                 Some(&command.op_id),
             );
-            counter!("projector_patches_total", 1, "type" => counter_patch.kind_str());
+            counter!("projector_patches_total", "type" => counter_patch.kind_str()).increment(1);
             patches.push(counter_patch);
         }
 
@@ -609,7 +609,7 @@ impl CommandExecutor {
             &command_enum,
             Some(&command.op_id),
         );
-        counter!("projector_patches_total", 1, "type" => patch.kind_str());
+        counter!("projector_patches_total", "type" => patch.kind_str()).increment(1);
 
         Ok(CommandApplication {
             version,

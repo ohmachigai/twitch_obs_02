@@ -142,6 +142,18 @@ pub fn init_metrics() -> Result<PrometheusHandle, TelemetryError> {
         "api_state_requests_total",
         "Count of state API requests, labelled by result"
     );
+    describe_counter!(
+        "db_ttl_deleted_total",
+        "Count of rows deleted by TTL sweeps, labelled by table"
+    );
+    describe_histogram!(
+        "db_checkpoint_seconds",
+        "Duration of WAL checkpoint operations in seconds"
+    );
+    describe_counter!(
+        "db_busy_total",
+        "Number of SQLite busy conditions encountered by maintenance tasks, labelled by operation"
+    );
     START_TIME.get_or_init(Instant::now);
 
     Ok(handle)
