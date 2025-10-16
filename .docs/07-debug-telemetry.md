@@ -84,6 +84,8 @@
 * **サイズ上限**：`payload` は**64 KiB を上限**、超過時は切り詰め `truncated=true` を付与（**MUST**）。
 * **背圧**：クライアントが遅い場合、**最古イベントからドロップ**（`dropped=N` の Tap 内メトリクスを増加）。
 
+**Storage ステージ固有のメッセージ**：TTL/WAL ジョブは `stage="storage"` で `meta.message ∈ {"ttl.event_raw","ttl.command_log","wal.checkpoint"}` を publish し、`out.payload.deleted` や `out.payload.busy` などの統計を含める（MUST）。
+
 ### 3.3 UI（任意）
 
 * `GET /_debug/tap/ui`：簡易 HTML（フィルタ、Pause、JSON 展開）。**本番では管理者のみ**。
@@ -199,9 +201,9 @@
 
 **DB / TTL**
 
-* `db_ttl_deleted_total{table}` **counter**
-* `db_checkpoint_seconds` **histogram**
-* `db_busy_total{op}` **counter**（busy_timeout 到達）
+* `db_ttl_deleted_total{table}` **counter** — `table ∈ {event_raw, command_log}`。TTL ジョブ 1 バッチあたりの削除件数を加算。
+* `db_checkpoint_seconds` **histogram** — `wal_checkpoint(TRUNCATE)` の実行時間（秒）。
+* `db_busy_total{op}` **counter**（busy_timeout 到達）— `op ∈ {ttl, checkpoint}`。ロック競合で処理をスキップした回数。
 
 **OAuth / Backfill**
 

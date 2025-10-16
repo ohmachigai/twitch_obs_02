@@ -86,6 +86,27 @@ impl Database {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Executes `PRAGMA wal_checkpoint(TRUNCATE)` and returns the reported counters.
+    pub async fn wal_checkpoint_truncate(&self) -> Result<WalCheckpointStats, sqlx::Error> {
+        let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(WalCheckpointStats {
+            busy_frames: row.get::<i64, _>("busy"),
+            log_frames: row.get::<i64, _>("log"),
+            checkpointed_frames: row.get::<i64, _>("checkpointed"),
+        })
+    }
+}
+
+/// Counters returned by `PRAGMA wal_checkpoint`.
+#[derive(Debug, Clone, Copy)]
+pub struct WalCheckpointStats {
+    pub busy_frames: i64,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
 }
 
 async fn apply_pragmas(pool: &SqlitePool) -> Result<(), StorageError> {
@@ -248,6 +269,29 @@ impl EventRawRepository {
             Err(err) => Err(EventRawError::Database(err)),
         }
     }
+
+    /// Deletes at most `limit` rows older than the given threshold.
+    pub async fn delete_older_than_batch(
+        &self,
+        threshold: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM event_raw \
+             WHERE rowid IN (\
+                 SELECT rowid FROM event_raw \
+                 WHERE received_at < ? \
+                 ORDER BY received_at \
+                 LIMIT ?\
+             )",
+        )
+        .bind(to_rfc3339(threshold))
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 /// Result of attempting to insert into `event_raw`.
@@ -348,6 +392,29 @@ impl CommandLogRepository {
         .map_err(CommandLogError::Database)?;
 
         Ok(version as u64)
+    }
+
+    /// Deletes at most `limit` rows older than the given threshold.
+    pub async fn delete_older_than_batch(
+        &self,
+        threshold: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM command_log \
+             WHERE rowid IN (\
+                 SELECT rowid FROM command_log \
+                 WHERE created_at < ? \
+                 ORDER BY created_at \
+                 LIMIT ?\
+             )",
+        )
+        .bind(to_rfc3339(threshold))
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     /// Finds an existing command log entry by `op_id`.
@@ -945,6 +1012,7 @@ fn map_status(value: &str) -> QueueEntryStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     async fn setup_db() -> Database {
         let db = Database::connect("sqlite::memory:?cache=shared")
             .await
@@ -1008,6 +1076,58 @@ mod tests {
 
         let outcome = repo.insert(record).await;
         assert!(matches!(outcome, Err(EventRawError::MissingBroadcaster)));
+    }
+
+    #[tokio::test]
+    async fn delete_older_event_raw_rows_in_batches() {
+        let db = setup_db().await;
+        let repo = db.event_raw();
+        let now = Utc::now();
+
+        for idx in 0..2 {
+            let record = NewEventRaw {
+                id: Cow::Owned(format!("evt-old-{idx}")),
+                broadcaster_id: Cow::Borrowed("b-1"),
+                msg_id: Cow::Owned(format!("msg-old-{idx}")),
+                event_type: Cow::Borrowed("test.event"),
+                payload_json: Cow::Borrowed("{}"),
+                event_at: now - ChronoDuration::hours(80 + idx),
+                received_at: now - ChronoDuration::hours(80 + idx),
+                source: "webhook",
+            };
+            assert!(matches!(
+                repo.insert(record).await,
+                Ok(EventRawInsertOutcome::Inserted)
+            ));
+        }
+
+        let record = NewEventRaw {
+            id: Cow::Borrowed("evt-new"),
+            broadcaster_id: Cow::Borrowed("b-1"),
+            msg_id: Cow::Borrowed("msg-new"),
+            event_type: Cow::Borrowed("test.event"),
+            payload_json: Cow::Borrowed("{}"),
+            event_at: now,
+            received_at: now,
+            source: "webhook",
+        };
+        assert!(matches!(
+            repo.insert(record).await,
+            Ok(EventRawInsertOutcome::Inserted)
+        ));
+
+        let threshold = now - ChronoDuration::hours(72);
+        let deleted = repo
+            .delete_older_than_batch(threshold, 1000)
+            .await
+            .expect("delete batch");
+        assert_eq!(deleted, 2);
+
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM event_raw")
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(remaining.0, 1);
     }
 
     #[tokio::test]
@@ -1112,6 +1232,53 @@ mod tests {
         let entry = found.unwrap();
         assert_eq!(entry.command_type, "queue.complete");
         assert_eq!(entry.payload_json, "{}");
+    }
+
+    #[tokio::test]
+    async fn delete_older_command_log_rows_respects_limit() {
+        let db = setup_db().await;
+        let repo = db.command_log();
+        let now = Utc::now();
+
+        for idx in 0..3 {
+            let mut tx = repo.begin().await.expect("begin");
+            repo.append(
+                &mut tx,
+                NewCommandLog {
+                    broadcaster_id: "b-1",
+                    op_id: Some(&format!("op-old-{idx}")),
+                    command_type: "queue.enqueue",
+                    payload_json: "{}",
+                    created_at: now - ChronoDuration::hours(90 - idx as i64),
+                },
+            )
+            .await
+            .expect("append");
+            tx.commit().await.expect("commit");
+        }
+
+        let threshold = now - ChronoDuration::hours(72);
+        let deleted = repo
+            .delete_older_than_batch(threshold, 1)
+            .await
+            .expect("delete batch");
+        assert_eq!(deleted, 1);
+
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_log")
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(remaining.0, 2);
+    }
+
+    #[tokio::test]
+    async fn wal_checkpoint_returns_counters() {
+        let db = setup_db().await;
+        let stats = db.wal_checkpoint_truncate().await.expect("wal checkpoint");
+
+        assert!(stats.busy_frames >= -1);
+        assert!(stats.log_frames >= -1);
+        assert!(stats.checkpointed_frames >= -1);
     }
 
     #[tokio::test]

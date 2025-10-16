@@ -275,7 +275,7 @@ async fn state_snapshot(
         .map(|value| value.to_string())
         .or_else(|| query.token.clone())
         .ok_or_else(|| {
-            counter!("api_state_requests_total", 1, "result" => "unauthorized");
+            counter!("api_state_requests_total", "result" => "unauthorized").increment(1);
             ProblemResponse::new(
                 StatusCode::UNAUTHORIZED,
                 "missing_token",
@@ -292,7 +292,7 @@ async fn state_snapshot(
     ) {
         Ok(audience) => audience,
         Err(err) => {
-            counter!("api_state_requests_total", 1, "result" => "unauthorized");
+            counter!("api_state_requests_total", "result" => "unauthorized").increment(1);
             return Err(problem_for_token_error(err));
         }
     };
@@ -300,7 +300,7 @@ async fn state_snapshot(
     let scope = match parse_state_scope(query.scope.as_deref(), query.since.as_deref()) {
         Ok(scope) => scope,
         Err(problem) => {
-            counter!("api_state_requests_total", 1, "result" => "error");
+            counter!("api_state_requests_total", "result" => "error").increment(1);
             return Err(problem);
         }
     };
@@ -313,7 +313,7 @@ async fn state_snapshot(
     {
         Ok(profile) => profile,
         Err(SettingsError::NotFound) => {
-            counter!("api_state_requests_total", 1, "result" => "error");
+            counter!("api_state_requests_total", "result" => "error").increment(1);
             return Err(ProblemResponse::new(
                 StatusCode::NOT_FOUND,
                 "broadcaster_not_found",
@@ -321,7 +321,7 @@ async fn state_snapshot(
             ));
         }
         Err(err) => {
-            counter!("api_state_requests_total", 1, "result" => "error");
+            counter!("api_state_requests_total", "result" => "error").increment(1);
             error!(
                 stage = "state",
                 broadcaster = %query.broadcaster,
@@ -341,7 +341,7 @@ async fn state_snapshot(
         {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                counter!("api_state_requests_total", 1, "result" => "error");
+                counter!("api_state_requests_total", "result" => "error").increment(1);
                 error!(
                     stage = "state",
                     broadcaster = %query.broadcaster,
@@ -356,7 +356,7 @@ async fn state_snapshot(
             }
         };
 
-    counter!("api_state_requests_total", 1, "result" => "ok");
+    counter!("api_state_requests_total", "result" => "ok").increment(1);
 
     let scope_label = match scope {
         StateScope::Session => "session",
@@ -414,7 +414,7 @@ async fn queue_dequeue(
     Json(payload): Json<QueueDequeueRequest>,
 ) -> Result<Json<QueueDequeueResponse>, ProblemResponse> {
     let token = extract_bearer_token(&headers).ok_or_else(|| {
-        counter!("api_queue_dequeue_requests_total", 1, "result" => "unauthorized");
+        counter!("api_queue_dequeue_requests_total", "result" => "unauthorized").increment(1);
         ProblemResponse::new(
             StatusCode::UNAUTHORIZED,
             "missing_token",
@@ -423,7 +423,7 @@ async fn queue_dequeue(
     })?;
 
     if Uuid::parse_str(&payload.op_id).is_err() {
-        counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+        counter!("api_queue_dequeue_requests_total", "result" => "error").increment(1);
         return Err(ProblemResponse::new(
             StatusCode::BAD_REQUEST,
             "invalid_op_id",
@@ -437,7 +437,7 @@ async fn queue_dequeue(
             .token_validator()
             .validate(token, Audience::Admin, &payload.broadcaster, now)
     {
-        counter!("api_queue_dequeue_requests_total", 1, "result" => "unauthorized");
+        counter!("api_queue_dequeue_requests_total", "result" => "unauthorized").increment(1);
         return Err(problem_for_token_error(err));
     }
 
@@ -449,7 +449,7 @@ async fn queue_dequeue(
     {
         Ok(profile) => profile,
         Err(SettingsError::NotFound) => {
-            counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+            counter!("api_queue_dequeue_requests_total", "result" => "error").increment(1);
             return Err(ProblemResponse::new(
                 StatusCode::NOT_FOUND,
                 "broadcaster_not_found",
@@ -457,7 +457,7 @@ async fn queue_dequeue(
             ));
         }
         Err(err) => {
-            counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+            counter!("api_queue_dequeue_requests_total", "result" => "error").increment(1);
             error!(
                 stage = "mutation",
                 broadcaster = %payload.broadcaster,
@@ -498,7 +498,7 @@ async fn queue_dequeue(
         Ok(application) => application,
         Err(err) => {
             let (problem, label) = queue_error_response(&payload, err);
-            counter!("api_queue_dequeue_requests_total", 1, "result" => label);
+            counter!("api_queue_dequeue_requests_total", "result" => label).increment(1);
             return Err(problem);
         }
     };
@@ -512,7 +512,7 @@ async fn queue_dequeue(
             user_today_count,
         } => (entry_id, mode, user_today_count),
         other => {
-            counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+            counter!("api_queue_dequeue_requests_total", "result" => "error").increment(1);
             error!(
                 stage = "mutation",
                 broadcaster = %payload.broadcaster,
@@ -529,7 +529,7 @@ async fn queue_dequeue(
         }
     };
 
-    counter!("api_queue_dequeue_requests_total", 1, "result" => "ok");
+    counter!("api_queue_dequeue_requests_total", "result" => "ok").increment(1);
     info!(
         stage = "mutation",
         kind = "queue.dequeue",
@@ -559,7 +559,7 @@ async fn settings_update(
     Json(payload): Json<SettingsUpdateRequest>,
 ) -> Result<Json<SettingsUpdateResponse>, ProblemResponse> {
     let token = extract_bearer_token(&headers).ok_or_else(|| {
-        counter!("api_settings_update_requests_total", 1, "result" => "unauthorized");
+        counter!("api_settings_update_requests_total", "result" => "unauthorized").increment(1);
         ProblemResponse::new(
             StatusCode::UNAUTHORIZED,
             "missing_token",
@@ -568,7 +568,7 @@ async fn settings_update(
     })?;
 
     if Uuid::parse_str(&payload.op_id).is_err() {
-        counter!("api_settings_update_requests_total", 1, "result" => "error");
+        counter!("api_settings_update_requests_total", "result" => "error").increment(1);
         return Err(ProblemResponse::new(
             StatusCode::BAD_REQUEST,
             "invalid_op_id",
@@ -582,7 +582,7 @@ async fn settings_update(
             .token_validator()
             .validate(token, Audience::Admin, &payload.broadcaster, now)
     {
-        counter!("api_settings_update_requests_total", 1, "result" => "unauthorized");
+        counter!("api_settings_update_requests_total", "result" => "unauthorized").increment(1);
         return Err(problem_for_token_error(err));
     }
 
@@ -594,7 +594,7 @@ async fn settings_update(
     {
         Ok(profile) => profile,
         Err(SettingsError::NotFound) => {
-            counter!("api_settings_update_requests_total", 1, "result" => "error");
+            counter!("api_settings_update_requests_total", "result" => "error").increment(1);
             return Err(ProblemResponse::new(
                 StatusCode::NOT_FOUND,
                 "broadcaster_not_found",
@@ -602,7 +602,7 @@ async fn settings_update(
             ));
         }
         Err(err) => {
-            counter!("api_settings_update_requests_total", 1, "result" => "error");
+            counter!("api_settings_update_requests_total", "result" => "error").increment(1);
             error!(
                 stage = "mutation",
                 broadcaster = %payload.broadcaster,
@@ -633,7 +633,7 @@ async fn settings_update(
         Ok(application) => application,
         Err(err) => {
             let (problem, label) = settings_error_response(&payload, err);
-            counter!("api_settings_update_requests_total", 1, "result" => label);
+            counter!("api_settings_update_requests_total", "result" => label).increment(1);
             return Err(problem);
         }
     };
@@ -643,7 +643,7 @@ async fn settings_update(
     let applied = match application.result {
         CommandApplyResult::SettingsUpdated { applied } => applied,
         other => {
-            counter!("api_settings_update_requests_total", 1, "result" => "error");
+            counter!("api_settings_update_requests_total", "result" => "error").increment(1);
             error!(
                 stage = "mutation",
                 broadcaster = %payload.broadcaster,
@@ -659,7 +659,7 @@ async fn settings_update(
         }
     };
 
-    counter!("api_settings_update_requests_total", 1, "result" => "ok");
+    counter!("api_settings_update_requests_total", "result" => "ok").increment(1);
     info!(
         stage = "mutation",
         kind = "settings.update",
