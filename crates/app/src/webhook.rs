@@ -814,7 +814,10 @@ mod tests {
     use crate::{router::app_router, telemetry};
     use twi_overlay_storage::Database;
 
+    use reqwest::Client;
     use serde_json::{json, Value};
+    use twi_overlay_twitch::{HelixClient, TwitchOAuthClient};
+    use url::Url;
 
     const BROADCASTER_ID: &str = "b-123";
     const FIXED_NOW: &str = "2024-01-01T00:00:00Z";
@@ -869,7 +872,19 @@ mod tests {
         let secret_arc: Arc<[u8]> = Arc::from(secret.clone().into_bytes().into_boxed_slice());
         let fixed_now = now;
         let clock = Arc::new(move || fixed_now);
-        let state = AppState::new(
+        let http = Client::builder().build().expect("client");
+        let oauth_client = TwitchOAuthClient::new(
+            "client",
+            "secret",
+            Url::parse("https://id.twitch.tv/oauth2/").expect("url"),
+            http.clone(),
+        );
+        let helix_client = HelixClient::new(
+            "client",
+            Url::parse("https://api.twitch.tv/helix/").expect("url"),
+            http,
+        );
+        let (state, _worker) = AppState::new(
             metrics,
             tap,
             database.clone(),
@@ -878,8 +893,14 @@ mod tests {
             64,
             StdDuration::from_secs(60),
             25,
-        )
-        .with_clock(clock);
+            helix_client,
+            oauth_client,
+            "http://localhost/oauth/callback".to_string(),
+            StdDuration::from_secs(600),
+            StdDuration::from_secs(300),
+            50,
+        );
+        let state = state.with_clock(clock);
 
         TestContext {
             state,

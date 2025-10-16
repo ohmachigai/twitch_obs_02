@@ -52,6 +52,12 @@ header {
   margin: 0;
 }
 
+.queue-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .queue button {
   margin-right: 0.5rem;
 }
@@ -160,4 +166,23 @@ select {
 .alert-success {
   background: rgba(16, 185, 129, 0.2);
   color: #6ee7b7;
+}
+
+.queue-status {
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+.queue-status--managed {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}
+
+.queue-status--manual {
+  background: rgba(249, 115, 22, 0.2);
+  color: #fbbf24;
 }

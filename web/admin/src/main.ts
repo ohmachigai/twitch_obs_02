@@ -117,6 +117,9 @@ function connectSse(sinceVersion?: number) {
     }
     try {
       const patch = JSON.parse((event as MessageEvent<string>).data) as Patch;
+      if (patch.type === 'redemption.updated') {
+        handleRedemptionPatch(patch);
+      }
       clientState = applyPatch(clientState, patch);
       renderState();
     } catch (err) {
@@ -177,7 +180,16 @@ function renderQueue() {
     const enqueuedAt = new Date(entry.enqueued_at).toLocaleString();
     meta.textContent = `Enqueued ${enqueuedAt}`;
     header.appendChild(name);
-    header.appendChild(meta);
+    const metaContainer = document.createElement('div');
+    metaContainer.className = 'queue-meta';
+    metaContainer.appendChild(meta);
+    const status = document.createElement('span');
+    status.className = entry.managed
+      ? 'queue-status queue-status--managed'
+      : 'queue-status queue-status--manual';
+    status.textContent = entry.managed ? 'Managed' : 'Manual';
+    metaContainer.appendChild(status);
+    header.appendChild(metaContainer);
 
     const actions = document.createElement('div');
     actions.className = 'queue-actions';
@@ -293,6 +305,15 @@ function handleError(error: unknown) {
     showAlert('error', error.message);
   } else {
     showAlert('error', 'Unexpected error occurred.');
+  }
+}
+
+function handleRedemptionPatch(patch: Extract<Patch, { type: 'redemption.updated' }>) {
+  if (patch.data.result === 'failed') {
+    const reason = patch.data.error ?? 'twitch:error';
+    showAlert('error', `Helix update failed (${reason}). Entry requires manual handling.`);
+  } else if (!patch.data.applicable && patch.data.error) {
+    showAlert('error', `Helix skipped (${patch.data.error}). Entry remains manual.`);
   }
 }
 

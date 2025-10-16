@@ -358,6 +358,16 @@ curl -sS -X POST /api/queue/dequeue -d '{"broadcaster":"b-dev","entry_id":"...",
 * 失敗時は `managed=false` で記録、サービス継続
 * Backfill が決定的に再生される
 
+#### 分割ステップ（小 PR）
+
+1. **Stage-1：仕様更新と基盤整備**（本ドキュメントの追加変更 / OAuth & Backfill スキーマ / AppConfig 拡張 / メトリクス宣言）
+2. **Stage-2：ストレージ + Twitch クライアント層**（SQLx リポジトリ、HTTP クライアント足場、Tap/メトリクス登録）
+3. **Stage-3：OAuth ハンドラと検証ループ**（`/oauth/login|callback|oauth2/validate` 実装、refresh/validate 結果の観測）
+4. **Stage-4：Helix redemption.update と UI 反映**（CommandExecutor 拡張、SSE パッチ/フロントエンド対応）
+5. **Stage-5：Backfill ワーカーとデバッグ導線**（周期 backfill、`/_debug/helix`、重複抑止・観測）
+
+> 各ステージは **ドキュメント→実装→テスト→観測点** の順で完結させ、CI 緑の Draft PR として段階的に昇格させる。
+
 ---
 
 ## 4. リスク & フェイルセーフ（実施順とセット）

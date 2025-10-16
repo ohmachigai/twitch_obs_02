@@ -368,6 +368,8 @@ pub struct RedemptionUpdateCommand {
     pub applicable: bool,
     pub result: CommandResult,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -382,6 +384,7 @@ impl RedemptionUpdateCommand {
             "mode": self.mode,
             "applicable": self.applicable,
             "result": self.result,
+            "managed": self.managed,
             "error": self.error,
         })
     }

@@ -190,8 +190,36 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
 
 * **パッチの型（代表）**：
   `queue.enqueued` / `queue.removed` / `queue.completed` / `counter.updated` /
-  `settings.updated` / `stream.online` / `stream.offline` / `state.replace`
-  （詳細は `03-domain-model.md` §6）
+  `settings.updated` / `redemption.updated` / `stream.online` / `stream.offline` /
+  `state.replace` （詳細は `03-domain-model.md` §6）
+
+#### `redemption.updated`
+
+* **目的**：Helix `redemptions.update` の適用結果を配信し、UI へ管理状態を同期する。
+* **データスキーマ**：
+
+  ```json
+  {
+    "type": "redemption.updated",
+    "version": 12351,
+    "at": "2025-10-12T13:00:11.001Z",
+    "data": {
+      "redemption_id": "84e3...",
+      "mode": "consume",            // `consume` or `refund`
+      "applicable": true,             // Helix 呼び出しを実行したか
+      "result": "ok",                // ok / failed / skipped
+      "managed": true,                // キュー項目を Helix 管理下に置いたか
+      "error": "twitch:forbidden"    // result=failed のときのみ（PII マスク済み）
+    }
+  }
+  ```
+
+* **規範**：
+
+  * `managed=true` は成功し Helix と整合済みであることを示す。`managed=false` は**手動復旧が必要**（UI で警告表示）。
+  * `applicable=false` の場合は Helix 呼び出しをスキップした理由を `error` に符号化する（例：`oauth:reauth-required`）。
+  * `error` 文字列は PII を含めず、`prefix:slug` 形式で分類（`twitch:unauthorized`, `network:timeout` など）。
+  * Queue snapshot (`state.replace`) 内の `queue[].managed` も同値で更新される（Helix 成功で `true`）。
 
 ---
 
@@ -342,19 +370,62 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
 }
 ```
 
+#### `GET /_debug/helix`
+
+| 項目 | 内容 |
+| --- | --- |
+| **目的** | OAuth / Helix Backfill の健全性確認（dev / 管理者専用） |
+| **クエリ** | `broadcaster`（必須, 内部 ID） |
+| **レスポンス** | `200 OK`：<br>`{"broadcaster":"...","token":{"expires_at":"...","requires_reauth":false,"last_validated_at":"...","last_failure_reason":null},"checkpoint":{"status":"idle|running|error","last_run_at":"...","last_seen_at":"...","last_redemption_id":"...","cursor":"...","error_message":null,"updated_at":"..."},"managed_rewards":["reward-id"]}` |
+| **注意** | アクセストークン等の秘匿情報は返さない。`requires_reauth=true` または `status=error` の場合は再同意が必要。 |
+
+> `checkpoint.status=running` のまま `updated_at` が古いときはワーカー停止を疑う。`cursor` や `last_redemption_id` は内部重複抑止カーソルであり、参照専用。
+
 ---
 
 ## 6. OAuth / 健全性
 
-### 6.1 OAuth（概要）
+### 6.1 `GET /oauth/login`
 
-* `GET /oauth/login` → Twitch 同意画面 → `GET /oauth/callback`（**broadcaster 紐付け**）。
-* 成功時に **EventSub 購読**（必要スコープ・App Token／User Token の使い分け）。
-* **/oauth2/validate** を**起動時＋定期**でチェック。失効時は **refresh** → ダメなら**再同意**へ。
+| 項目 | 内容 |
+| --- | --- |
+| **目的** | 配信者（`broadcaster`）ごとに Twitch 同意画面へ遷移する URL を生成する |
+| **クエリ** | `broadcaster`（必須, 内部 ID）、`redirect_to`（任意, `/admin` など相対 URL） |
+| **挙動** | `state`（ULID）と `code_verifier` を生成し、`oauth_login_states` に保存。`redirect_to` はホワイトリスト済みパスのみ許容（`/admin`, `/overlay` など）。 |
+| **レスポンス** | `302 Found`（`Location` = `https://id.twitch.tv/oauth2/authorize?...`）。CSRF 保護のため `state` をクエリに含める。 |
+| **エラー** | `400`（未知の `broadcaster` / `redirect_to` が不正）、`409`（同一配信者の既存 state が有効なまま再発行された場合）。 |
 
-> 具体のスコープ・Transport は `twitch/` 実装に委任（契約は `03` を参照）。
+> `scope` は `channel:read:redemptions` / `channel:manage:redemptions` を最低含める。`login_hint` に `twitch_user_id` が既存の場合は `oauth_links` を参照し補助する。
 
-### 6.2 健全性
+### 6.2 `GET /oauth/callback`
+
+| 項目 | 内容 |
+| --- | --- |
+| **目的** | Twitch から返ってくる `code` を交換し、`oauth_links` にアクセストークンを保存する |
+| **クエリ** | `state`（必須）, `code`（必須）, `error`（任意, Twitch 失敗時） |
+| **挙動** | `oauth_login_states` から `state` を引き当て CSRF を検証。`code_verifier` を用いて `TWITCH_OAUTH_TOKEN_URL` に `POST`。応答の `access_token` / `refresh_token` / `expires_in` を保存。`state` 行は消費後に削除。 |
+| **レスポンス** | 成功時 `302 Found` → `redirect_to`（なければ `/admin/oauth/success`）。失敗時 `302 Found` → `/admin/oauth/error?reason=...`（エラーコードを列挙）。 |
+| **エラー** | `400`（state 不一致/期限切れ）、`401`（code 交換失敗）、`409`（broadcaster が異なる state を利用）。 |
+
+保存するアクセストークン情報：
+
+* `access_token`（平文保存だが OS 権限で保護、ログ/Tap では完全マスク）
+* `refresh_token`
+* `expires_at`（UTC ISO8601）
+* `managed_scopes_json`（最終的に付与された scope の配列）
+* `last_validated_at` / `last_refreshed_at` / `requires_reauth`（自動更新）
+
+### 6.3 `POST /oauth2/validate`
+
+| 項目 | 内容 |
+| --- | --- |
+| **目的** | 既存トークンの健全性確認・自動 refresh・Backfill のトリガ |
+| **Body** | `{"broadcaster":"<internal-id>","force":false}`（`force=true` で期限内でも検証） |
+| **レスポンス** | `200 OK`：`{"status":"ok|refresh|reauth","managed_rewards":[],"next_check_at":"..."}`。`reauth` の場合は管理 UI で再同意導線を表示。 |
+| **副作用** | `oauth_links.requires_reauth` 更新、refresh/validate 結果を `StageKind::Oauth` タップに publish、正常完了時は Helix Backfill ワーカーへ `broadcaster` を即時通知。 |
+| **エラー** | `404`（リンクが存在しない）、`409`（別プロセスが refresh 実行中）、`500`（Twitch API 失敗）。 |
+
+### 6.4 健全性
 
 * `GET /healthz`：`200 OK`（依存ヘルス簡易チェック）
 * `GET /metrics`：Prometheus テキストフォーマット

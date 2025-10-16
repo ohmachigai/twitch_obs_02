@@ -33,16 +33,26 @@ impl Projector {
         at: DateTime<Utc>,
         command: &RedemptionUpdateCommand,
     ) -> Patch {
+        let mut data = json!({
+            "redemption_id": command.redemption_id,
+            "mode": command.mode,
+            "applicable": command.applicable,
+            "result": command.result,
+            "managed": command.managed.unwrap_or(false),
+            "error": command.error,
+        });
+
+        if command.error.is_none() {
+            if let Some(object) = data.as_object_mut() {
+                object.remove("error");
+            }
+        }
+
         Patch {
             version,
             kind: PatchKind::RedemptionUpdated,
             at,
-            data: json!({
-                "redemption_id": command.redemption_id,
-                "mode": command.mode,
-                "applicable": command.applicable,
-                "result": command.result,
-            }),
+            data,
         }
     }
 
@@ -157,11 +167,14 @@ mod tests {
             mode: crate::types::RedemptionUpdateMode::Consume,
             applicable: true,
             result: CommandResult::Ok,
+            managed: Some(true),
             error: None,
         };
         let patch = Projector::redemption_updated(10, at, &command);
         assert_eq!(patch.kind_str(), "redemption.updated");
         assert_eq!(patch.data["redemption_id"].as_str(), Some("red-1"));
+        assert_eq!(patch.data["managed"].as_bool(), Some(true));
+        assert!(patch.data.get("error").is_none());
     }
 
     #[test]

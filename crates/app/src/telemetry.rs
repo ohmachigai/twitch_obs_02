@@ -154,6 +154,34 @@ pub fn init_metrics() -> Result<PrometheusHandle, TelemetryError> {
         "db_busy_total",
         "Number of SQLite busy conditions encountered by maintenance tasks, labelled by operation"
     );
+    describe_counter!(
+        "oauth_validate_failures_total",
+        "Count of OAuth token validation attempts that resulted in failure"
+    );
+    describe_counter!(
+        "oauth_refresh_total",
+        "Count of OAuth refresh attempts, labelled by result"
+    );
+    describe_counter!(
+        "backfill_processed_total",
+        "Count of redemption records processed by Helix backfill"
+    );
+    describe_counter!(
+        "backfill_duplicates_total",
+        "Count of Helix backfill entries dropped because they already exist"
+    );
+    describe_counter!(
+        "helix_redemptions_update_total",
+        "Result of Helix redemption update calls labelled by outcome"
+    );
+    describe_histogram!(
+        "helix_redemptions_latency_seconds",
+        "Latency of Helix redemption update calls in seconds"
+    );
+    describe_counter!(
+        "helix_redemptions_managed_total",
+        "Count of queue entries transitioning managed state"
+    );
     START_TIME.get_or_init(Instant::now);
 
     Ok(handle)

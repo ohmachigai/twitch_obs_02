@@ -45,6 +45,8 @@ PRAGMA temp_store = MEMORY;        -- 一時 B-tree をメモリに（任意）
 | Broadcaster/Settings | `broadcasters`    | `id`                               | `twitch_broadcaster_id` UNIQUE                                                    |
 | User                 | `users`           | `id`                               | (`email` UNIQUE), (FK→`broadcasters.id` nullable)                                 |
 | OAuthLink            | `oauth_links`     | `id`                               | `broadcaster_id` FK, `twitch_user_id` UNIQUE per broadcaster                      |
+| OAuthLoginState      | `oauth_login_states` | `state`                         | TTL 付き（`expires_at`）、`broadcaster_id` FK                                       |
+| BackfillCheckpoint   | `helix_backfill_checkpoints` | `broadcaster_id`      | `cursor` / `last_redemption_id` / `status`、`updated_at`                           |
 | EventRaw(72h)        | `event_raw`       | `id`                               | `msg_id` UNIQUE, `received_at` INDEX                                              |
 | CommandLog(72h)      | `command_log`     | (`broadcaster_id`,`version`)       | `op_id` UNIQUE (partial), `created_at` INDEX                                      |
 | StateIndex           | `state_index`     | `broadcaster_id`                   | `current_version`                                                                 |
@@ -201,6 +203,42 @@ CREATE UNIQUE INDEX ux_stream_open_unique
   WHERE ended_at IS NULL;
 ```
 
+### 4.4 `0004_oauth_backfill_scaffolding.sql` — OAuth state / Helix Backfill
+
+```sql
+-- oauth_login_states: OAuth state (PKCE) を保存し CSRF を防ぐ
+CREATE TABLE oauth_login_states (
+  state TEXT PRIMARY KEY,
+  broadcaster_id TEXT NOT NULL REFERENCES broadcasters(id) ON DELETE CASCADE,
+  code_verifier TEXT NOT NULL,
+  redirect_to TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+-- oauth_links: トークン健全性の追跡列を追加
+ALTER TABLE oauth_links ADD COLUMN managed_scopes_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE oauth_links ADD COLUMN last_validated_at TEXT;
+ALTER TABLE oauth_links ADD COLUMN last_refreshed_at TEXT;
+ALTER TABLE oauth_links ADD COLUMN last_failure_at TEXT;
+ALTER TABLE oauth_links ADD COLUMN last_failure_reason TEXT;
+ALTER TABLE oauth_links ADD COLUMN requires_reauth INTEGER NOT NULL DEFAULT 0 CHECK(requires_reauth IN (0,1));
+
+-- helix_backfill_checkpoints: UNFULFILLED 再取得の進捗管理
+CREATE TABLE helix_backfill_checkpoints (
+  broadcaster_id TEXT PRIMARY KEY REFERENCES broadcasters(id) ON DELETE CASCADE,
+  cursor TEXT,
+  last_redemption_id TEXT,
+  last_seen_at TEXT,
+  last_run_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('idle','running','error')),
+  error_message TEXT,
+  updated_at TEXT NOT NULL
+);
+```
+
+> `oauth_login_states` は **短寿命 TTL（既定 10 分）でクリーンアップ**。`helix_backfill_checkpoints.status` は Backfill ワーカーの状態（`idle`／`running`／`error`）を示し、`error_message` で最新の Helix 応答を残す。`cursor` / `last_redemption_id` / `last_seen_at` は Helix UNFULFILLED 再取得の再開ポイントであり、ワーカーは `running` → `idle|error` の順で更新する。。
+
 ---
 
 ## 5. 代表クエリ（規範・参考）
@@ -275,6 +313,8 @@ SELECT COUNT(*) > 0 AS within_window
 * **対象**：`event_raw`, `command_log`
 * **条件**：`created_at/received_at < now() - 72h`
 
+> `oauth_login_states` は **10 分** を上限に別ジョブで削除（Backfill/OAuth ワーカーが担保）。
+
 ### 6.2 小分け削除ジョブ（**必須**）
 
 > **単位**：1 周期で **最大 1000 行**。枯渇までループ。
@@ -308,7 +348,7 @@ DELETE FROM command_log
 
   * 外部キー：`broadcaster_id` は `broadcasters.id` に参照整合。
   * 列制約：`role`, `status`, `source` の **CHECK**。
-  * ユニーク：`event_raw.msg_id`、`oauth_links(broadcaster_id,twitch_user_id)`、`queue_entries.redemption_id`（partial）。
+  * ユニーク：`event_raw.msg_id`、`oauth_links(broadcaster_id,twitch_user_id)`、`oauth_login_states.state`、`helix_backfill_checkpoints.broadcaster_id`、`queue_entries.redemption_id`（partial）。
   * 部分 UNIQUE：`command_log(broadcaster_id, op_id) WHERE op_id IS NOT NULL`。
   * 未終了セッションの一意：`stream_sessions` の部分 UNIQUE。
 

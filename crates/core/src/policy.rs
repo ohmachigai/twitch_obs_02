@@ -96,6 +96,7 @@ impl PolicyEngine {
                 },
                 applicable: false,
                 result: CommandResult::Skipped,
+                managed: None,
                 error: None,
             });
             PolicyOutcome::duplicate(vec![update])
@@ -117,6 +118,7 @@ impl PolicyEngine {
                 mode: RedemptionUpdateMode::Consume,
                 applicable: false,
                 result: CommandResult::Skipped,
+                managed: None,
                 error: None,
             });
             PolicyOutcome::applied(vec![enqueue, update])

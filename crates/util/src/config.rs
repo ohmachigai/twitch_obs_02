@@ -53,6 +53,14 @@ pub struct AppConfig {
     pub sse_heartbeat_secs: u64,
     pub sse_ring_max: usize,
     pub sse_ring_ttl_secs: u64,
+    pub twitch_client_id: String,
+    pub twitch_client_secret: String,
+    pub oauth_redirect_uri: String,
+    pub twitch_oauth_base_url: String,
+    pub twitch_api_base_url: String,
+    pub oauth_state_ttl_secs: u64,
+    pub helix_backfill_interval_secs: u64,
+    pub helix_backfill_page_size: u32,
 }
 
 impl AppConfig {
@@ -119,6 +127,53 @@ impl AppConfig {
             Err(_) => 120,
         };
 
+        let twitch_client_id =
+            read_required_secret("TWITCH_CLIENT_ID", environment, "local-client-id")?;
+        let twitch_client_secret =
+            read_required_secret("TWITCH_CLIENT_SECRET", environment, "local-client-secret")?;
+        let oauth_redirect_uri = match env::var("OAUTH_REDIRECT_URI") {
+            Ok(value) if !value.is_empty() => value,
+            Ok(_) => {
+                return Err(ConfigError::MissingEnvVar(
+                    "OAUTH_REDIRECT_URI must not be empty".to_string(),
+                ))
+            }
+            Err(_) if environment.is_development() || environment.is_test() => {
+                "http://127.0.0.1:8080/oauth/callback".to_string()
+            }
+            Err(_) => {
+                return Err(ConfigError::MissingEnvVar(
+                    "OAUTH_REDIRECT_URI is required in production".to_string(),
+                ))
+            }
+        };
+
+        let twitch_oauth_base_url = env::var("TWITCH_OAUTH_BASE_URL")
+            .unwrap_or_else(|_| "https://id.twitch.tv/oauth2".to_string());
+        let twitch_api_base_url = env::var("TWITCH_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.twitch.tv/helix".to_string());
+
+        let oauth_state_ttl_secs = match env::var("OAUTH_STATE_TTL_SECS") {
+            Ok(value) => value.parse::<u64>().map_err(|_| {
+                ConfigError::InvalidNumber("OAUTH_STATE_TTL_SECS".to_string(), value)
+            })?,
+            Err(_) => 600,
+        };
+
+        let helix_backfill_interval_secs = match env::var("HELIX_BACKFILL_INTERVAL_SECS") {
+            Ok(value) => value.parse::<u64>().map_err(|_| {
+                ConfigError::InvalidNumber("HELIX_BACKFILL_INTERVAL_SECS".to_string(), value)
+            })?,
+            Err(_) => 300,
+        };
+
+        let helix_backfill_page_size = match env::var("HELIX_BACKFILL_PAGE_SIZE") {
+            Ok(value) => value.parse::<u32>().map_err(|_| {
+                ConfigError::InvalidNumber("HELIX_BACKFILL_PAGE_SIZE".to_string(), value)
+            })?,
+            Err(_) => 50,
+        };
+
         Ok(Self {
             bind_addr,
             environment,
@@ -128,6 +183,14 @@ impl AppConfig {
             sse_heartbeat_secs,
             sse_ring_max,
             sse_ring_ttl_secs,
+            twitch_client_id,
+            twitch_client_secret,
+            oauth_redirect_uri,
+            twitch_oauth_base_url,
+            twitch_api_base_url,
+            oauth_state_ttl_secs,
+            helix_backfill_interval_secs,
+            helix_backfill_page_size,
         })
     }
 }
@@ -165,6 +228,25 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ConfigError> {
     hex::decode(value).map_err(|_| ConfigError::InvalidHex(value.to_string()))
 }
 
+fn read_required_secret(
+    var: &str,
+    environment: Environment,
+    dev_default: &str,
+) -> Result<String, ConfigError> {
+    match env::var(var) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(ConfigError::MissingEnvVar(format!(
+            "{var} must not be empty"
+        ))),
+        Err(_) if environment.is_development() || environment.is_test() => {
+            Ok(dev_default.to_string())
+        }
+        Err(_) => Err(ConfigError::MissingEnvVar(format!(
+            "{var} is required in production"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +273,17 @@ mod tests {
         assert_eq!(config.sse_heartbeat_secs, 25);
         assert_eq!(config.sse_ring_max, 1000);
         assert_eq!(config.sse_ring_ttl_secs, 120);
+        assert_eq!(config.twitch_client_id, "local-client-id");
+        assert_eq!(config.twitch_client_secret, "local-client-secret");
+        assert_eq!(
+            config.oauth_redirect_uri,
+            "http://127.0.0.1:8080/oauth/callback"
+        );
+        assert_eq!(config.twitch_oauth_base_url, "https://id.twitch.tv/oauth2");
+        assert_eq!(config.twitch_api_base_url, "https://api.twitch.tv/helix");
+        assert_eq!(config.oauth_state_ttl_secs, 600);
+        assert_eq!(config.helix_backfill_interval_secs, 300);
+        assert_eq!(config.helix_backfill_page_size, 50);
     }
 
     #[test]
@@ -215,6 +308,12 @@ mod tests {
         env::set_var("SSE_HEARTBEAT_SECS", "30");
         env::set_var("SSE_RING_MAX", "512");
         env::set_var("SSE_RING_TTL_SECS", "180");
+        env::set_var("TWITCH_CLIENT_ID", "prod-client");
+        env::set_var("TWITCH_CLIENT_SECRET", "prod-secret");
+        env::set_var("OAUTH_REDIRECT_URI", "https://example.com/oauth/callback");
+        env::set_var("OAUTH_STATE_TTL_SECS", "900");
+        env::set_var("HELIX_BACKFILL_INTERVAL_SECS", "120");
+        env::set_var("HELIX_BACKFILL_PAGE_SIZE", "75");
 
         let config = AppConfig::from_env().expect("config should load");
         assert_eq!(config.environment, Environment::Production);
@@ -225,6 +324,15 @@ mod tests {
         assert_eq!(config.sse_heartbeat_secs, 30);
         assert_eq!(config.sse_ring_max, 512);
         assert_eq!(config.sse_ring_ttl_secs, 180);
+        assert_eq!(config.twitch_client_id, "prod-client");
+        assert_eq!(config.twitch_client_secret, "prod-secret");
+        assert_eq!(
+            config.oauth_redirect_uri,
+            "https://example.com/oauth/callback"
+        );
+        assert_eq!(config.oauth_state_ttl_secs, 900);
+        assert_eq!(config.helix_backfill_interval_secs, 120);
+        assert_eq!(config.helix_backfill_page_size, 75);
 
         env::remove_var("APP_ENV");
         env::remove_var("APP_BIND_ADDR");
@@ -234,6 +342,12 @@ mod tests {
         env::remove_var("SSE_HEARTBEAT_SECS");
         env::remove_var("SSE_RING_MAX");
         env::remove_var("SSE_RING_TTL_SECS");
+        env::remove_var("TWITCH_CLIENT_ID");
+        env::remove_var("TWITCH_CLIENT_SECRET");
+        env::remove_var("OAUTH_REDIRECT_URI");
+        env::remove_var("OAUTH_STATE_TTL_SECS");
+        env::remove_var("HELIX_BACKFILL_INTERVAL_SECS");
+        env::remove_var("HELIX_BACKFILL_PAGE_SIZE");
     }
 
     #[test]
@@ -241,6 +355,10 @@ mod tests {
         let _guard = test_support::env_vars_lock();
         env::set_var("APP_ENV", "production");
         env::remove_var("WEBHOOK_SECRET");
+        env::set_var("TWITCH_CLIENT_ID", "prod-client");
+        env::set_var("TWITCH_CLIENT_SECRET", "prod-secret");
+        env::set_var("OAUTH_REDIRECT_URI", "https://example.com/oauth/callback");
+        env::set_var("SSE_TOKEN_SIGNING_KEY", "abcdef");
 
         let err = AppConfig::from_env().expect_err("missing secret should error");
         assert!(
@@ -248,5 +366,32 @@ mod tests {
         );
 
         env::remove_var("APP_ENV");
+        env::remove_var("TWITCH_CLIENT_ID");
+        env::remove_var("TWITCH_CLIENT_SECRET");
+        env::remove_var("OAUTH_REDIRECT_URI");
+        env::remove_var("SSE_TOKEN_SIGNING_KEY");
+    }
+
+    #[test]
+    fn production_requires_twitch_client_secret() {
+        let _guard = test_support::env_vars_lock();
+        env::set_var("APP_ENV", "production");
+        env::set_var("WEBHOOK_SECRET", "prod-secret");
+        env::set_var("TWITCH_CLIENT_ID", "prod-client");
+        env::remove_var("TWITCH_CLIENT_SECRET");
+        env::set_var("OAUTH_REDIRECT_URI", "https://example.com/oauth/callback");
+        env::set_var("SSE_TOKEN_SIGNING_KEY", "abcdef");
+
+        let err = AppConfig::from_env().expect_err("missing secret should error");
+        assert!(matches!(
+            err,
+            ConfigError::MissingEnvVar(message) if message.contains("TWITCH_CLIENT_SECRET")
+        ));
+
+        env::remove_var("APP_ENV");
+        env::remove_var("WEBHOOK_SECRET");
+        env::remove_var("TWITCH_CLIENT_ID");
+        env::remove_var("OAUTH_REDIRECT_URI");
+        env::remove_var("SSE_TOKEN_SIGNING_KEY");
     }
 }
