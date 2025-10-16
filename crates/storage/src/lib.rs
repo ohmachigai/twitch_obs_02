@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use twi_overlay_core::types::{QueueEntry, QueueEntryStatus, QueueRemovalReason, Settings};
 
-use serde_json::to_string;
+use serde_json::{self, to_string};
 
 /// Top-level database handle that owns the SQLite connection pool.
 #[derive(Clone)]
@@ -78,6 +78,27 @@ impl Database {
     /// Returns a handle for manipulating daily counters.
     pub fn daily_counters(&self) -> DailyCounterRepository {
         DailyCounterRepository {
+            pool: self.pool.clone(),
+        }
+    }
+
+    /// Returns a handle for manipulating OAuth login states.
+    pub fn oauth_login_states(&self) -> OauthLoginStateRepository {
+        OauthLoginStateRepository {
+            pool: self.pool.clone(),
+        }
+    }
+
+    /// Returns a handle for interacting with persisted OAuth links.
+    pub fn oauth_links(&self) -> OauthLinkRepository {
+        OauthLinkRepository {
+            pool: self.pool.clone(),
+        }
+    }
+
+    /// Returns a handle for Helix backfill checkpoints.
+    pub fn helix_backfill(&self) -> HelixBackfillRepository {
+        HelixBackfillRepository {
             pool: self.pool.clone(),
         }
     }
@@ -670,6 +691,41 @@ SELECT id,
         Ok(row.map(QueueEntryRow::into_domain))
     }
 
+    /// Finds a queue entry by redemption identifier within the given transaction.
+    pub async fn find_entry_by_redemption_for_update(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        broadcaster_id: &str,
+        redemption_id: &str,
+    ) -> Result<Option<QueueEntry>, QueueError> {
+        let row = sqlx::query_as::<_, QueueEntryRow>(
+            r#"
+SELECT id,
+       broadcaster_id,
+       user_id,
+       user_login,
+       user_display_name,
+       user_avatar,
+       reward_id,
+       redemption_id,
+       enqueued_at as "enqueued_at: DateTime<Utc>",
+       status,
+       status_reason,
+       managed,
+       last_updated_at as "last_updated_at: DateTime<Utc>"
+  FROM queue_entries
+ WHERE broadcaster_id = ?
+   AND redemption_id = ?
+            "#,
+        )
+        .bind(broadcaster_id)
+        .bind(redemption_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        Ok(row.map(QueueEntryRow::into_domain))
+    }
+
     /// Marks an entry as completed, returning the updated representation.
     pub async fn mark_completed(
         &self,
@@ -772,6 +828,51 @@ UPDATE queue_entries
         .bind(entry_id)
         .fetch_one(&mut **tx)
         .await?;
+
+        Ok(row.into_domain())
+    }
+
+    /// Updates the managed flag for a queue entry, returning the refreshed representation.
+    pub async fn update_managed(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        broadcaster_id: &str,
+        entry_id: &str,
+        managed: bool,
+        updated_at: DateTime<Utc>,
+    ) -> Result<QueueEntry, QueueError> {
+        let row = sqlx::query_as::<_, QueueEntryRow>(
+            r#"
+UPDATE queue_entries
+   SET managed = ?,
+       last_updated_at = ?
+ WHERE broadcaster_id = ?
+   AND id = ?
+ RETURNING id,
+           broadcaster_id,
+           user_id,
+           user_login,
+           user_display_name,
+           user_avatar,
+           reward_id,
+           redemption_id,
+           enqueued_at as "enqueued_at: DateTime<Utc>",
+           status,
+           status_reason,
+           managed,
+           last_updated_at as "last_updated_at: DateTime<Utc>"
+            "#,
+        )
+        .bind(if managed { 1 } else { 0 })
+        .bind(to_rfc3339(updated_at))
+        .bind(broadcaster_id)
+        .bind(entry_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(QueueError::NotFound);
+        };
 
         Ok(row.into_domain())
     }
@@ -996,8 +1097,817 @@ pub enum DailyCounterError {
     Database(#[from] sqlx::Error),
 }
 
+/// Repository managing ephemeral OAuth login state records.
+#[derive(Clone)]
+pub struct OauthLoginStateRepository {
+    pool: SqlitePool,
+}
+
+impl OauthLoginStateRepository {
+    /// Inserts a freshly generated OAuth login state.
+    pub async fn insert(
+        &self,
+        record: &NewOauthLoginState<'_>,
+    ) -> Result<(), OauthLoginStateError> {
+        sqlx::query(
+            r#"
+INSERT INTO oauth_login_states(state, broadcaster_id, code_verifier, redirect_to, created_at, expires_at)
+VALUES(?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&record.state)
+        .bind(record.broadcaster_id)
+        .bind(&record.code_verifier)
+        .bind(&record.redirect_to)
+        .bind(to_rfc3339(record.created_at))
+        .bind(to_rfc3339(record.expires_at))
+        .execute(&self.pool)
+        .await
+        .map_err(OauthLoginStateError::Database)?;
+
+        Ok(())
+    }
+
+    /// Consumes an existing OAuth login state, deleting it atomically.
+    pub async fn consume(
+        &self,
+        state: &str,
+    ) -> Result<Option<OauthLoginState>, OauthLoginStateError> {
+        let row = sqlx::query_as::<_, OauthLoginStateRow>(
+            r#"
+DELETE FROM oauth_login_states
+ WHERE state = ?
+ RETURNING state,
+           broadcaster_id,
+           code_verifier,
+           redirect_to,
+           created_at,
+           expires_at
+            "#,
+        )
+        .bind(state)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(OauthLoginStateError::Database)?;
+
+        row.map(|row| row.try_into())
+            .transpose()
+            .map_err(OauthLoginStateError::Decode)
+    }
+
+    /// Deletes expired login states to enforce TTL.
+    pub async fn purge_expired(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<u64, OauthLoginStateError> {
+        let result = sqlx::query(
+            r#"
+DELETE FROM oauth_login_states
+ WHERE rowid IN (
+    SELECT rowid
+      FROM oauth_login_states
+     WHERE expires_at <= ?
+     ORDER BY expires_at
+     LIMIT ?
+ )
+            "#,
+        )
+        .bind(to_rfc3339(now))
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(OauthLoginStateError::Database)?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Returns true when a non-expired login state already exists for the broadcaster.
+    pub async fn has_active(
+        &self,
+        broadcaster_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, OauthLoginStateError> {
+        let row = sqlx::query(
+            r#"
+SELECT 1
+  FROM oauth_login_states
+ WHERE broadcaster_id = ?
+   AND expires_at > ?
+ LIMIT 1
+            "#,
+        )
+        .bind(broadcaster_id)
+        .bind(to_rfc3339(now))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(OauthLoginStateError::Database)?;
+
+        Ok(row.is_some())
+    }
+}
+
+/// Domain representation of the OAuth login state row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OauthLoginState {
+    pub state: String,
+    pub broadcaster_id: String,
+    pub code_verifier: String,
+    pub redirect_to: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// New OAuth login state payload.
+pub struct NewOauthLoginState<'a> {
+    pub state: String,
+    pub broadcaster_id: &'a str,
+    pub code_verifier: String,
+    pub redirect_to: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Error)]
+pub enum OauthLoginStateError {
+    #[error("database error: {0}")]
+    Database(sqlx::Error),
+    #[error("failed to decode oauth login state: {0}")]
+    Decode(#[from] OauthStateDecodeError),
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct OauthLoginStateRow {
+    state: String,
+    broadcaster_id: String,
+    code_verifier: String,
+    redirect_to: Option<String>,
+    created_at: String,
+    expires_at: String,
+}
+
+impl TryFrom<OauthLoginStateRow> for OauthLoginState {
+    type Error = OauthStateDecodeError;
+
+    fn try_from(value: OauthLoginStateRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            state: value.state,
+            broadcaster_id: value.broadcaster_id,
+            code_verifier: value.code_verifier,
+            redirect_to: value.redirect_to,
+            created_at: parse_datetime(&value.created_at)?,
+            expires_at: parse_datetime(&value.expires_at)?,
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum OauthStateDecodeError {
+    #[error("invalid timestamp format: {0}")]
+    Timestamp(#[from] chrono::ParseError),
+}
+
+/// Repository managing OAuth link persistence.
+#[derive(Clone)]
+pub struct OauthLinkRepository {
+    pool: SqlitePool,
+}
+
+impl OauthLinkRepository {
+    /// Persists a new or existing OAuth link, resetting failure markers.
+    pub async fn upsert_link(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        record: &NewOauthLink<'_>,
+    ) -> Result<OauthLink, OauthLinkError> {
+        let scopes = serde_json::to_string(&record.scopes)?;
+        let managed_scopes = serde_json::to_string(&record.managed_scopes)?;
+        let row = sqlx::query_as::<_, OauthLinkRow>(
+            r#"
+INSERT INTO oauth_links(
+    id,
+    broadcaster_id,
+    twitch_user_id,
+    scopes_json,
+    managed_scopes_json,
+    access_token,
+    refresh_token,
+    expires_at,
+    created_at,
+    updated_at,
+    last_validated_at,
+    last_refreshed_at,
+    last_failure_at,
+    last_failure_reason,
+    requires_reauth
+)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0)
+ON CONFLICT(broadcaster_id, twitch_user_id) DO UPDATE SET
+    scopes_json = excluded.scopes_json,
+    managed_scopes_json = excluded.managed_scopes_json,
+    access_token = excluded.access_token,
+    refresh_token = excluded.refresh_token,
+    expires_at = excluded.expires_at,
+    updated_at = excluded.updated_at,
+    last_validated_at = NULL,
+    last_refreshed_at = NULL,
+    last_failure_at = NULL,
+    last_failure_reason = NULL,
+    requires_reauth = 0
+RETURNING id,
+          broadcaster_id,
+          twitch_user_id,
+          scopes_json,
+          managed_scopes_json,
+          access_token,
+          refresh_token,
+          expires_at,
+          created_at,
+          updated_at,
+          last_validated_at,
+          last_refreshed_at,
+          last_failure_at,
+          last_failure_reason,
+          requires_reauth
+            "#,
+        )
+        .bind(&record.id)
+        .bind(record.broadcaster_id)
+        .bind(&record.twitch_user_id)
+        .bind(scopes)
+        .bind(managed_scopes)
+        .bind(&record.access_token)
+        .bind(&record.refresh_token)
+        .bind(to_rfc3339(record.expires_at))
+        .bind(to_rfc3339(record.created_at))
+        .bind(to_rfc3339(record.updated_at))
+        .fetch_one(&mut **tx)
+        .await?;
+
+        row.try_into().map_err(OauthLinkError::Decode)
+    }
+
+    /// Retrieves the OAuth link for the provided broadcaster.
+    pub async fn fetch_by_broadcaster(
+        &self,
+        broadcaster_id: &str,
+    ) -> Result<Option<OauthLink>, OauthLinkError> {
+        let row = sqlx::query_as::<_, OauthLinkRow>(
+            r#"
+SELECT id,
+       broadcaster_id,
+       twitch_user_id,
+       scopes_json,
+       managed_scopes_json,
+       access_token,
+       refresh_token,
+       expires_at,
+       created_at,
+       updated_at,
+       last_validated_at,
+       last_refreshed_at,
+       last_failure_at,
+       last_failure_reason,
+       requires_reauth
+  FROM oauth_links
+ WHERE broadcaster_id = ?
+ ORDER BY updated_at DESC
+ LIMIT 1
+            "#,
+        )
+        .bind(broadcaster_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| row.try_into())
+            .transpose()
+            .map_err(OauthLinkError::Decode)
+    }
+
+    /// Lists OAuth links that are still active and not flagged for reauthorization.
+    pub async fn list_active(&self, now: DateTime<Utc>) -> Result<Vec<OauthLink>, OauthLinkError> {
+        let rows = sqlx::query_as::<_, OauthLinkRow>(
+            r#"
+SELECT id,
+       broadcaster_id,
+       twitch_user_id,
+       scopes_json,
+       managed_scopes_json,
+       access_token,
+       refresh_token,
+       expires_at,
+       created_at,
+       updated_at,
+       last_validated_at,
+       last_refreshed_at,
+       last_failure_at,
+       last_failure_reason,
+       requires_reauth
+  FROM oauth_links
+ WHERE expires_at > ?
+   AND requires_reauth = 0
+ ORDER BY updated_at DESC
+            "#,
+        )
+        .bind(to_rfc3339(now))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| row.try_into())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OauthLinkError::Decode)
+    }
+
+    /// Retrieves the OAuth link for the provided broadcaster using the supplied transaction.
+    pub async fn fetch_by_broadcaster_for_update(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        broadcaster_id: &str,
+    ) -> Result<Option<OauthLink>, OauthLinkError> {
+        let row = sqlx::query_as::<_, OauthLinkRow>(
+            r#"
+SELECT id,
+       broadcaster_id,
+       twitch_user_id,
+       scopes_json,
+       managed_scopes_json,
+       access_token,
+       refresh_token,
+       expires_at,
+       created_at,
+       updated_at,
+       last_validated_at,
+       last_refreshed_at,
+       last_failure_at,
+       last_failure_reason,
+       requires_reauth
+  FROM oauth_links
+ WHERE broadcaster_id = ?
+ ORDER BY updated_at DESC
+ LIMIT 1
+            "#,
+        )
+        .bind(broadcaster_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        row.map(|row| row.try_into())
+            .transpose()
+            .map_err(OauthLinkError::Decode)
+    }
+
+    /// Updates tokens after a successful refresh/validation cycle.
+    pub async fn update_tokens(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        update: &OauthTokenUpdate<'_>,
+    ) -> Result<OauthLink, OauthLinkError> {
+        let scopes = serde_json::to_string(&update.scopes)?;
+        let managed_scopes = serde_json::to_string(&update.managed_scopes)?;
+        let refreshed_at = to_rfc3339(update.refreshed_at);
+        let validated_at = to_rfc3339(update.validated_at);
+        let row = sqlx::query_as::<_, OauthLinkRow>(
+            r#"
+UPDATE oauth_links
+   SET access_token = ?,
+       refresh_token = ?,
+       expires_at = ?,
+       scopes_json = ?,
+       managed_scopes_json = ?,
+       last_refreshed_at = ?,
+       last_validated_at = ?,
+       updated_at = ?,
+       last_failure_at = NULL,
+       last_failure_reason = NULL,
+       requires_reauth = 0
+ WHERE broadcaster_id = ?
+   AND twitch_user_id = ?
+ RETURNING id,
+           broadcaster_id,
+           twitch_user_id,
+           scopes_json,
+           managed_scopes_json,
+           access_token,
+           refresh_token,
+           expires_at,
+           created_at,
+           updated_at,
+           last_validated_at,
+           last_refreshed_at,
+           last_failure_at,
+           last_failure_reason,
+           requires_reauth
+            "#,
+        )
+        .bind(&update.access_token)
+        .bind(&update.refresh_token)
+        .bind(to_rfc3339(update.expires_at))
+        .bind(scopes)
+        .bind(managed_scopes)
+        .bind(&refreshed_at)
+        .bind(&validated_at)
+        .bind(to_rfc3339(update.updated_at))
+        .bind(update.broadcaster_id)
+        .bind(&update.twitch_user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Err(OauthLinkError::NotFound);
+        };
+
+        row.try_into().map_err(OauthLinkError::Decode)
+    }
+
+    /// Records a validation outcome without changing tokens.
+    pub async fn mark_validation_result(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        result: &OauthValidationResult<'_>,
+    ) -> Result<(), OauthLinkError> {
+        let validated_at = to_rfc3339(result.validated_at);
+        let failure_at = result
+            .failure
+            .as_ref()
+            .map(|failure| to_rfc3339(failure.occurred_at));
+        let rows = sqlx::query(
+            r#"
+UPDATE oauth_links
+   SET last_validated_at = ?,
+       requires_reauth = ?,
+       last_failure_at = ?,
+       last_failure_reason = ?
+ WHERE broadcaster_id = ?
+   AND twitch_user_id = ?
+            "#,
+        )
+        .bind(&validated_at)
+        .bind(if result.requires_reauth { 1 } else { 0 })
+        .bind(failure_at.as_deref())
+        .bind(result.failure.as_ref().map(|failure| failure.reason))
+        .bind(result.broadcaster_id)
+        .bind(&result.twitch_user_id)
+        .execute(&mut **tx)
+        .await?;
+
+        if rows.rows_affected() == 0 {
+            return Err(OauthLinkError::NotFound);
+        }
+
+        Ok(())
+    }
+
+    /// Marks a refresh/validation failure and optionally toggles re-authentication.
+    pub async fn mark_failure(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        failure: &OauthFailure<'_>,
+    ) -> Result<(), OauthLinkError> {
+        let failure_at = to_rfc3339(failure.occurred_at);
+        let rows = sqlx::query(
+            r#"
+UPDATE oauth_links
+   SET last_failure_at = ?,
+       last_failure_reason = ?,
+       requires_reauth = ?
+ WHERE broadcaster_id = ?
+   AND twitch_user_id = ?
+            "#,
+        )
+        .bind(&failure_at)
+        .bind(failure.reason)
+        .bind(if failure.requires_reauth { 1 } else { 0 })
+        .bind(failure.broadcaster_id)
+        .bind(&failure.twitch_user_id)
+        .execute(&mut **tx)
+        .await?;
+
+        if rows.rows_affected() == 0 {
+            return Err(OauthLinkError::NotFound);
+        }
+
+        Ok(())
+    }
+}
+
+/// Complete OAuth link record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OauthLink {
+    pub id: String,
+    pub broadcaster_id: String,
+    pub twitch_user_id: String,
+    pub scopes: Vec<String>,
+    pub managed_scopes: Vec<String>,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_validated_at: Option<DateTime<Utc>>,
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+    pub last_failure_reason: Option<String>,
+    pub requires_reauth: bool,
+}
+
+/// New OAuth link payload.
+pub struct NewOauthLink<'a> {
+    pub id: String,
+    pub broadcaster_id: &'a str,
+    pub twitch_user_id: String,
+    pub scopes: Vec<String>,
+    pub managed_scopes: Vec<String>,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// OAuth token refresh/update payload.
+pub struct OauthTokenUpdate<'a> {
+    pub broadcaster_id: &'a str,
+    pub twitch_user_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub scopes: Vec<String>,
+    pub managed_scopes: Vec<String>,
+    pub refreshed_at: DateTime<Utc>,
+    pub validated_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Validation outcome payload.
+pub struct OauthValidationResult<'a> {
+    pub broadcaster_id: &'a str,
+    pub twitch_user_id: String,
+    pub validated_at: DateTime<Utc>,
+    pub requires_reauth: bool,
+    pub failure: Option<OauthValidationFailure<'a>>,
+}
+
+/// Validation failure details.
+pub struct OauthValidationFailure<'a> {
+    pub occurred_at: DateTime<Utc>,
+    pub reason: &'a str,
+}
+
+/// Generic OAuth failure payload.
+pub struct OauthFailure<'a> {
+    pub broadcaster_id: &'a str,
+    pub twitch_user_id: String,
+    pub occurred_at: DateTime<Utc>,
+    pub reason: &'a str,
+    pub requires_reauth: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum OauthLinkError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("failed to decode oauth link: {0}")]
+    Decode(#[from] OauthLinkDecodeError),
+    #[error("oauth link not found")]
+    NotFound,
+    #[error("failed to encode scopes json: {0}")]
+    Encode(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum OauthLinkDecodeError {
+    #[error("invalid json payload: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("invalid timestamp: {0}")]
+    Timestamp(#[from] chrono::ParseError),
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct OauthLinkRow {
+    id: String,
+    broadcaster_id: String,
+    twitch_user_id: String,
+    scopes_json: String,
+    managed_scopes_json: String,
+    access_token: String,
+    refresh_token: String,
+    expires_at: String,
+    created_at: String,
+    updated_at: String,
+    last_validated_at: Option<String>,
+    last_refreshed_at: Option<String>,
+    last_failure_at: Option<String>,
+    last_failure_reason: Option<String>,
+    requires_reauth: i64,
+}
+
+impl TryFrom<OauthLinkRow> for OauthLink {
+    type Error = OauthLinkDecodeError;
+
+    fn try_from(value: OauthLinkRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.id,
+            broadcaster_id: value.broadcaster_id,
+            twitch_user_id: value.twitch_user_id,
+            scopes: serde_json::from_str(&value.scopes_json)?,
+            managed_scopes: serde_json::from_str(&value.managed_scopes_json)?,
+            access_token: value.access_token,
+            refresh_token: value.refresh_token,
+            expires_at: parse_datetime(&value.expires_at)?,
+            created_at: parse_datetime(&value.created_at)?,
+            updated_at: parse_datetime(&value.updated_at)?,
+            last_validated_at: parse_optional_datetime(value.last_validated_at)?,
+            last_refreshed_at: parse_optional_datetime(value.last_refreshed_at)?,
+            last_failure_at: parse_optional_datetime(value.last_failure_at)?,
+            last_failure_reason: value.last_failure_reason,
+            requires_reauth: value.requires_reauth != 0,
+        })
+    }
+}
+
+/// Repository handling Helix backfill checkpoints.
+#[derive(Clone)]
+pub struct HelixBackfillRepository {
+    pool: SqlitePool,
+}
+
+impl HelixBackfillRepository {
+    /// Retrieves the checkpoint for a broadcaster.
+    pub async fn fetch(
+        &self,
+        broadcaster_id: &str,
+    ) -> Result<Option<HelixBackfillCheckpoint>, HelixBackfillError> {
+        let row = sqlx::query_as::<_, HelixBackfillRow>(
+            r#"
+SELECT broadcaster_id,
+       cursor,
+       last_redemption_id,
+       last_seen_at,
+       last_run_at,
+       status,
+       error_message,
+       updated_at
+  FROM helix_backfill_checkpoints
+ WHERE broadcaster_id = ?
+            "#,
+        )
+        .bind(broadcaster_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(HelixBackfillError::Database)?;
+
+        row.map(|row| row.try_into())
+            .transpose()
+            .map_err(HelixBackfillError::Decode)
+    }
+
+    /// Upserts the checkpoint atomically.
+    pub async fn upsert(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        checkpoint: &HelixBackfillCheckpoint,
+    ) -> Result<(), HelixBackfillError> {
+        let last_seen_at = checkpoint.last_seen_at.map(to_rfc3339);
+        let error_message = checkpoint.error_message.clone();
+        sqlx::query(
+            r#"
+INSERT INTO helix_backfill_checkpoints(
+    broadcaster_id,
+    cursor,
+    last_redemption_id,
+    last_seen_at,
+    last_run_at,
+    status,
+    error_message,
+    updated_at
+)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(broadcaster_id) DO UPDATE SET
+    cursor = excluded.cursor,
+    last_redemption_id = excluded.last_redemption_id,
+    last_seen_at = excluded.last_seen_at,
+    last_run_at = excluded.last_run_at,
+    status = excluded.status,
+    error_message = excluded.error_message,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&checkpoint.broadcaster_id)
+        .bind(&checkpoint.cursor)
+        .bind(&checkpoint.last_redemption_id)
+        .bind(last_seen_at.as_deref())
+        .bind(to_rfc3339(checkpoint.last_run_at))
+        .bind(checkpoint.status.as_str())
+        .bind(error_message)
+        .bind(to_rfc3339(checkpoint.updated_at))
+        .execute(&mut **tx)
+        .await
+        .map_err(HelixBackfillError::Database)?;
+
+        Ok(())
+    }
+}
+
+/// Helix backfill checkpoint domain object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelixBackfillCheckpoint {
+    pub broadcaster_id: String,
+    pub cursor: Option<String>,
+    pub last_redemption_id: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub last_run_at: DateTime<Utc>,
+    pub status: HelixBackfillStatus,
+    pub error_message: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Status of the Helix backfill worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelixBackfillStatus {
+    Idle,
+    Running,
+    Error,
+}
+
+impl HelixBackfillStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Error => "error",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, HelixBackfillDecodeError> {
+        match value {
+            "idle" => Ok(Self::Idle),
+            "running" => Ok(Self::Running),
+            "error" => Ok(Self::Error),
+            other => Err(HelixBackfillDecodeError::Status(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum HelixBackfillError {
+    #[error("database error: {0}")]
+    Database(sqlx::Error),
+    #[error("failed to decode checkpoint: {0}")]
+    Decode(#[from] HelixBackfillDecodeError),
+}
+
+#[derive(Debug, Error)]
+pub enum HelixBackfillDecodeError {
+    #[error("invalid timestamp: {0}")]
+    Timestamp(#[from] chrono::ParseError),
+    #[error("invalid status value: {0}")]
+    Status(String),
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct HelixBackfillRow {
+    broadcaster_id: String,
+    cursor: Option<String>,
+    last_redemption_id: Option<String>,
+    last_seen_at: Option<String>,
+    last_run_at: String,
+    status: String,
+    error_message: Option<String>,
+    updated_at: String,
+}
+
+impl TryFrom<HelixBackfillRow> for HelixBackfillCheckpoint {
+    type Error = HelixBackfillDecodeError;
+
+    fn try_from(value: HelixBackfillRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            broadcaster_id: value.broadcaster_id,
+            cursor: value.cursor,
+            last_redemption_id: value.last_redemption_id,
+            last_seen_at: parse_optional_datetime(value.last_seen_at)?,
+            last_run_at: parse_datetime(&value.last_run_at)?,
+            status: HelixBackfillStatus::from_str(&value.status)?,
+            error_message: value.error_message,
+            updated_at: parse_datetime(&value.updated_at)?,
+        })
+    }
+}
+
 fn to_rfc3339(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn parse_datetime(value: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value).map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_optional_datetime(
+    value: Option<String>,
+) -> Result<Option<DateTime<Utc>>, chrono::ParseError> {
+    value
+        .map(|v| DateTime::parse_from_rfc3339(&v).map(|dt| dt.with_timezone(&Utc)))
+        .transpose()
 }
 
 fn map_status(value: &str) -> QueueEntryStatus {
@@ -1013,6 +1923,359 @@ fn map_status(value: &str) -> QueueEntryStatus {
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
+
+    #[tokio::test]
+    async fn oauth_login_state_insert_and_consume() {
+        let db = setup_db().await;
+        let repo = db.oauth_login_states();
+        let state = NewOauthLoginState {
+            state: "state-1".into(),
+            broadcaster_id: "b-1",
+            code_verifier: "verifier".into(),
+            redirect_to: Some("/admin".into()),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
+        };
+
+        repo.insert(&state).await.expect("insert login state");
+
+        let consumed = repo
+            .consume("state-1")
+            .await
+            .expect("consume state")
+            .expect("state present");
+        assert_eq!(consumed.state, "state-1");
+        assert_eq!(consumed.redirect_to.as_deref(), Some("/admin"));
+
+        let missing = repo.consume("state-1").await.expect("consume again");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn oauth_login_state_purge_expired_removes_rows() {
+        let db = setup_db().await;
+        let repo = db.oauth_login_states();
+        let now = Utc::now();
+        for idx in 0..3 {
+            repo.insert(&NewOauthLoginState {
+                state: format!("state-{idx}"),
+                broadcaster_id: "b-1",
+                code_verifier: "verifier".into(),
+                redirect_to: None,
+                created_at: now - ChronoDuration::minutes(20 + idx),
+                expires_at: now - ChronoDuration::minutes(5 + idx),
+            })
+            .await
+            .expect("insert state");
+        }
+
+        let purged = repo.purge_expired(now, 2).await.expect("purge");
+        assert_eq!(purged, 2);
+
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_login_states")
+            .fetch_one(db.pool())
+            .await
+            .expect("count states");
+        assert_eq!(remaining.0, 1);
+    }
+
+    #[tokio::test]
+    async fn oauth_login_state_has_active_respects_expiration() {
+        let db = setup_db().await;
+        let repo = db.oauth_login_states();
+        let now = Utc::now();
+        repo.insert(&NewOauthLoginState {
+            state: "state-1".into(),
+            broadcaster_id: "b-1",
+            code_verifier: "verifier".into(),
+            redirect_to: None,
+            created_at: now,
+            expires_at: now + ChronoDuration::minutes(10),
+        })
+        .await
+        .expect("insert state");
+
+        assert!(repo
+            .has_active("b-1", now + ChronoDuration::minutes(1))
+            .await
+            .expect("has active"));
+
+        assert!(!repo
+            .has_active("b-1", now + ChronoDuration::minutes(15))
+            .await
+            .expect("has active after expiry"));
+    }
+
+    #[tokio::test]
+    async fn oauth_link_upsert_and_fetch_roundtrip() {
+        let db = setup_db().await;
+        let repo = db.oauth_links();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let link = repo
+            .upsert_link(
+                &mut tx,
+                &NewOauthLink {
+                    id: "link-1".into(),
+                    broadcaster_id: "b-1",
+                    twitch_user_id: "twitch-123".into(),
+                    scopes: vec!["scope:a".into(), "scope:b".into()],
+                    managed_scopes: vec!["scope:b".into()],
+                    access_token: "access".into(),
+                    refresh_token: "refresh".into(),
+                    expires_at: now + ChronoDuration::hours(1),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("upsert");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(link.twitch_user_id, "twitch-123");
+        assert_eq!(link.scopes.len(), 2);
+        assert!(link.last_validated_at.is_none());
+
+        let fetched = repo
+            .fetch_by_broadcaster("b-1")
+            .await
+            .expect("fetch")
+            .expect("link present");
+        assert_eq!(fetched.twitch_user_id, "twitch-123");
+        assert_eq!(fetched.access_token, "access");
+        assert!(!fetched.requires_reauth);
+    }
+
+    #[tokio::test]
+    async fn oauth_link_updates_tokens_and_validation() {
+        let db = setup_db().await;
+        let repo = db.oauth_links();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        repo.upsert_link(
+            &mut tx,
+            &NewOauthLink {
+                id: "link-1".into(),
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-123".into(),
+                scopes: vec!["scope:a".into()],
+                managed_scopes: vec!["scope:a".into()],
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_at: now + ChronoDuration::hours(1),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("upsert");
+        tx.commit().await.expect("commit");
+
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin upd");
+        repo.update_tokens(
+            &mut tx,
+            &OauthTokenUpdate {
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-123".into(),
+                access_token: "new-access".into(),
+                refresh_token: "new-refresh".into(),
+                expires_at: now + ChronoDuration::hours(2),
+                scopes: vec!["scope:a".into(), "scope:b".into()],
+                managed_scopes: vec!["scope:b".into()],
+                refreshed_at: now,
+                validated_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("update tokens");
+        tx.commit().await.expect("commit upd");
+
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin validate");
+        repo.mark_validation_result(
+            &mut tx,
+            &OauthValidationResult {
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-123".into(),
+                validated_at: now,
+                requires_reauth: true,
+                failure: Some(OauthValidationFailure {
+                    occurred_at: now,
+                    reason: "invalid token",
+                }),
+            },
+        )
+        .await
+        .expect("mark validation");
+        tx.commit().await.expect("commit validate");
+
+        let fetched = repo
+            .fetch_by_broadcaster("b-1")
+            .await
+            .expect("fetch")
+            .expect("link present");
+        assert_eq!(fetched.access_token, "new-access");
+        assert!(fetched.requires_reauth);
+        assert_eq!(
+            fetched.last_failure_reason.as_deref(),
+            Some("invalid token")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_link_marks_failure() {
+        let db = setup_db().await;
+        let repo = db.oauth_links();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        repo.upsert_link(
+            &mut tx,
+            &NewOauthLink {
+                id: "link-1".into(),
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-123".into(),
+                scopes: vec!["scope:a".into()],
+                managed_scopes: vec!["scope:a".into()],
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_at: now + ChronoDuration::hours(1),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("upsert");
+        tx.commit().await.expect("commit");
+
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin fail");
+        repo.mark_failure(
+            &mut tx,
+            &OauthFailure {
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-123".into(),
+                occurred_at: now,
+                reason: "token expired",
+                requires_reauth: true,
+            },
+        )
+        .await
+        .expect("mark failure");
+        tx.commit().await.expect("commit fail");
+
+        let fetched = repo
+            .fetch_by_broadcaster("b-1")
+            .await
+            .expect("fetch")
+            .expect("link present");
+        assert!(fetched.requires_reauth);
+        assert_eq!(
+            fetched.last_failure_reason.as_deref(),
+            Some("token expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_link_list_active_filters_expired_and_reauth() {
+        let db = setup_db().await;
+        let repo = db.oauth_links();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+
+        repo.upsert_link(
+            &mut tx,
+            &NewOauthLink {
+                id: "link-1".into(),
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-1".into(),
+                scopes: vec!["scope:a".into()],
+                managed_scopes: vec!["scope:a".into()],
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_at: now + ChronoDuration::hours(1),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("upsert active");
+
+        repo.upsert_link(
+            &mut tx,
+            &NewOauthLink {
+                id: "link-2".into(),
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-2".into(),
+                scopes: vec!["scope:a".into()],
+                managed_scopes: vec!["scope:a".into()],
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_at: now - ChronoDuration::minutes(5),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("upsert expired");
+        tx.commit().await.expect("commit initial");
+
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin failure");
+        repo.mark_failure(
+            &mut tx,
+            &OauthFailure {
+                broadcaster_id: "b-1",
+                twitch_user_id: "twitch-2".into(),
+                occurred_at: now,
+                reason: "expired",
+                requires_reauth: true,
+            },
+        )
+        .await
+        .expect("mark failure");
+        tx.commit().await.expect("commit failure");
+
+        let active = repo.list_active(now).await.expect("list active");
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].broadcaster_id, "b-1");
+    }
+
+    #[tokio::test]
+    async fn helix_backfill_upsert_and_fetch() {
+        let db = setup_db().await;
+        let repo = db.helix_backfill();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let checkpoint = HelixBackfillCheckpoint {
+            broadcaster_id: "b-1".into(),
+            cursor: Some("cursor".into()),
+            last_redemption_id: Some("red-1".into()),
+            last_seen_at: Some(now - ChronoDuration::minutes(5)),
+            last_run_at: now,
+            status: HelixBackfillStatus::Running,
+            error_message: Some("processing".into()),
+            updated_at: now,
+        };
+        repo.upsert(&mut tx, &checkpoint).await.expect("upsert");
+        tx.commit().await.expect("commit");
+
+        let fetched = repo
+            .fetch("b-1")
+            .await
+            .expect("fetch")
+            .expect("checkpoint present");
+        assert_eq!(fetched.cursor.as_deref(), Some("cursor"));
+        assert_eq!(fetched.status, HelixBackfillStatus::Running);
+        assert_eq!(fetched.error_message.as_deref(), Some("processing"));
+    }
     async fn setup_db() -> Database {
         let db = Database::connect("sqlite::memory:?cache=shared")
             .await
@@ -1418,6 +2681,76 @@ mod tests {
             err,
             QueueError::InvalidTransition(QueueEntryStatus::Completed)
         ));
+    }
+
+    #[tokio::test]
+    async fn queue_find_by_redemption_within_transaction() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let new_entry = NewQueueEntry {
+            id: "q-lookup".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-lookup",
+            user_login: "lookup".into(),
+            user_display_name: "Lookup".into(),
+            user_avatar: None,
+            reward_id: "reward-lookup",
+            redemption_id: Some("red-lookup".into()),
+            enqueued_at: now,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &new_entry)
+            .await
+            .expect("insert entry");
+
+        let found = queue_repo
+            .find_entry_by_redemption_for_update(&mut tx, "b-1", "red-lookup")
+            .await
+            .expect("fetch")
+            .expect("entry");
+        assert_eq!(found.id, "q-lookup");
+        assert_eq!(found.redemption_id.as_deref(), Some("red-lookup"));
+    }
+
+    #[tokio::test]
+    async fn queue_update_managed_toggles_flag() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let new_entry = NewQueueEntry {
+            id: "q-managed".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-flag",
+            user_login: "flag".into(),
+            user_display_name: "Flag".into(),
+            user_avatar: None,
+            reward_id: "reward-flag",
+            redemption_id: Some("red-flag".into()),
+            enqueued_at: now,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &new_entry)
+            .await
+            .expect("insert entry");
+
+        let updated = queue_repo
+            .update_managed(&mut tx, "b-1", "q-managed", true, Utc::now())
+            .await
+            .expect("update managed");
+        assert!(updated.managed);
     }
 
     #[tokio::test]

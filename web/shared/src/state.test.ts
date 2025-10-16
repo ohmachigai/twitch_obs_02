@@ -118,6 +118,26 @@ describe('shared state helpers', () => {
     expect(next.settings.policy.duplicate_policy).toBe('refund');
     expect(next.settings.policy.target_rewards).toEqual([]);
   });
+
+  it('updates queue managed flag on redemption.updated', () => {
+    const state = createClientState(baseSnapshot);
+    const patch: Patch = {
+      type: 'redemption.updated',
+      version: 11,
+      at: '2024-01-01T10:20:00Z',
+      data: {
+        redemption_id: 'entry-1-redemption',
+        mode: 'consume',
+        applicable: true,
+        result: 'ok',
+        managed: true,
+      },
+    };
+
+    const next = applyPatch(state, patch);
+    const entry = next.queue.find((item) => item.id === 'entry-1');
+    expect(entry?.managed).toBe(true);
+  });
 });
 
 function makeEntry(id: string, userId: string, enqueuedAt: string): QueueEntry {
@@ -128,6 +148,7 @@ function makeEntry(id: string, userId: string, enqueuedAt: string): QueueEntry {
     user_login: userId,
     user_display_name: userId,
     reward_id: 'reward-1',
+    redemption_id: `${id}-redemption`,
     enqueued_at: enqueuedAt,
     status: 'QUEUED',
     managed: false,

@@ -108,6 +108,8 @@ export interface RedemptionUpdatedPatch {
     mode: string;
     applicable: boolean;
     result: string;
+    managed: boolean;
+    error?: string;
   };
 }
 

@@ -259,10 +259,15 @@ function App() {
             <ul className="queue__list">
               {queueToRender.map((entry) => (
                 <li key={entry.id} className="queue__entry">
-                  <span className="queue__name">{entry.user_display_name}</span>
-                  <span className="queue__meta">
-                    #{clientState.counters[entry.user_id] ?? 0}
-                  </span>
+                  <div className="queue__row">
+                    <span className="queue__name">{entry.user_display_name}</span>
+                    <span className="queue__meta">
+                      #{clientState.counters[entry.user_id] ?? 0}
+                    </span>
+                  </div>
+                  {!entry.managed && (
+                    <span className="queue__badge queue__badge--manual">Manual</span>
+                  )}
                 </li>
               ))}
             </ul>

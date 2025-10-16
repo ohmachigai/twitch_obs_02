@@ -20,8 +20,10 @@ use twi_overlay_core::types::{
     SettingsUpdateCommand,
 };
 use twi_overlay_storage::{Database, QueueError, SettingsError};
+use twi_overlay_twitch::{HelixClient, TwitchOAuthClient};
 use uuid::Uuid;
 
+use crate::backfill;
 use crate::command::{CommandApplyResult, CommandExecutor, CommandExecutorError};
 use crate::problem::ProblemResponse;
 use crate::sse::{Audience, SseHub, SseStream, SseTokenValidator, TokenError};
@@ -31,7 +33,7 @@ use crate::tap::{
     StagePayload, TapFilter, TapHub,
 };
 use crate::webhook::emit_sse_stage;
-use crate::{telemetry, webhook};
+use crate::{oauth, telemetry, webhook};
 use twi_overlay_core::types::StateSnapshot;
 
 #[derive(Clone)]
@@ -46,6 +48,16 @@ pub struct AppState {
     sse: SseHub,
     token_validator: SseTokenValidator,
     sse_heartbeat_secs: u64,
+    #[cfg(test)]
+    helix_client: HelixClient,
+    oauth_client: TwitchOAuthClient,
+    oauth_redirect_uri: String,
+    oauth_state_ttl: Duration,
+    backfill: backfill::BackfillService,
+    #[cfg(test)]
+    helix_backfill_interval: Duration,
+    #[cfg(test)]
+    helix_backfill_page_size: u32,
 }
 
 impl AppState {
@@ -59,29 +71,80 @@ impl AppState {
         sse_ring_max: usize,
         sse_ring_ttl: Duration,
         sse_heartbeat_secs: u64,
-    ) -> Self {
+        helix_client: HelixClient,
+        oauth_client: TwitchOAuthClient,
+        oauth_redirect_uri: String,
+        oauth_state_ttl: Duration,
+        helix_backfill_interval: Duration,
+        helix_backfill_page_size: u32,
+    ) -> (Self, backfill::BackfillWorker) {
         let clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync> = Arc::new(Utc::now);
-        let command_executor = CommandExecutor::new(storage.clone(), tap.clone(), clock.clone());
+        let policy_engine: Arc<PolicyEngine> = Arc::new(PolicyEngine::new());
+        let command_executor = CommandExecutor::new(
+            storage.clone(),
+            tap.clone(),
+            clock.clone(),
+            helix_client.clone(),
+        );
         let sse = SseHub::new(storage.clone(), sse_ring_max, sse_ring_ttl);
+        let (backfill_service, backfill_worker) = backfill::BackfillService::new(
+            storage.clone(),
+            tap.clone(),
+            policy_engine.clone(),
+            command_executor.clone(),
+            sse.clone(),
+            helix_client.clone(),
+            clock.clone(),
+            helix_backfill_interval,
+            helix_backfill_page_size,
+        );
         let token_validator = SseTokenValidator::new(sse_token_secret);
-        Self {
+        let state = Self {
             metrics,
             tap,
             storage,
             webhook_secret,
             clock,
-            policy_engine: Arc::new(PolicyEngine::new()),
+            policy_engine,
             command_executor,
             sse,
             token_validator,
             sse_heartbeat_secs,
-        }
+            #[cfg(test)]
+            helix_client,
+            oauth_client,
+            oauth_redirect_uri,
+            oauth_state_ttl,
+            backfill: backfill_service,
+            #[cfg(test)]
+            helix_backfill_interval,
+            #[cfg(test)]
+            helix_backfill_page_size,
+        };
+        (state, backfill_worker)
     }
 
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
         self.clock = clock.clone();
-        self.command_executor = CommandExecutor::new(self.storage.clone(), self.tap.clone(), clock);
+        self.command_executor = CommandExecutor::new(
+            self.storage.clone(),
+            self.tap.clone(),
+            clock,
+            self.helix_client.clone(),
+        );
+        let (service, _worker) = backfill::BackfillService::new(
+            self.storage.clone(),
+            self.tap.clone(),
+            self.policy_engine.clone(),
+            self.command_executor.clone(),
+            self.sse.clone(),
+            self.helix_client.clone(),
+            self.clock.clone(),
+            self.helix_backfill_interval,
+            self.helix_backfill_page_size,
+        );
+        self.backfill = service;
         self
     }
 
@@ -124,6 +187,22 @@ impl AppState {
     pub fn sse_heartbeat(&self) -> u64 {
         self.sse_heartbeat_secs
     }
+
+    pub fn oauth_client(&self) -> &TwitchOAuthClient {
+        &self.oauth_client
+    }
+
+    pub fn oauth_redirect_uri(&self) -> &str {
+        &self.oauth_redirect_uri
+    }
+
+    pub fn oauth_state_ttl(&self) -> Duration {
+        self.oauth_state_ttl
+    }
+
+    pub fn backfill(&self) -> &backfill::BackfillService {
+        &self.backfill
+    }
 }
 
 pub fn app_router(state: AppState) -> Router {
@@ -131,12 +210,16 @@ pub fn app_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/_debug/tap", get(debug_tap))
+        .route("/_debug/helix", get(backfill::debug_helix))
         .route("/overlay/sse", get(overlay_sse))
         .route("/admin/sse", get(admin_sse))
         .route("/api/state", get(state_snapshot))
         .route("/api/queue/dequeue", post(queue_dequeue))
         .route("/api/settings/update", post(settings_update))
         .route("/eventsub/webhook", post(webhook::handle))
+        .route("/oauth/login", get(oauth::login))
+        .route("/oauth/callback", get(oauth::callback))
+        .route("/oauth2/validate", post(oauth::validate))
         .with_state(state)
 }
 
@@ -1026,7 +1109,10 @@ mod tests {
 
     use crate::sse::TokenClaims;
     use crate::tap::StageEvent;
+    use reqwest::Client;
     use twi_overlay_core::types::{QueueEntryStatus, Settings};
+    use twi_overlay_twitch::{HelixClient, TwitchOAuthClient};
+    use url::Url;
 
     async fn setup_state() -> AppState {
         let metrics = telemetry::init_metrics().expect("metrics init");
@@ -1038,7 +1124,19 @@ mod tests {
         database.run_migrations().await.expect("migrations");
 
         let secret: Arc<[u8]> = Arc::from(b"test-secret".to_vec().into_boxed_slice());
-        AppState::new(
+        let http = Client::builder().build().expect("client");
+        let oauth_client = TwitchOAuthClient::new(
+            "client",
+            "secret",
+            Url::parse("https://id.twitch.tv/oauth2/").expect("url"),
+            http.clone(),
+        );
+        let helix_client = HelixClient::new(
+            "client",
+            Url::parse("https://api.twitch.tv/helix/").expect("url"),
+            http,
+        );
+        let (state, _worker) = AppState::new(
             metrics,
             tap,
             database,
@@ -1047,7 +1145,14 @@ mod tests {
             64,
             StdDuration::from_secs(60),
             25,
-        )
+            helix_client,
+            oauth_client,
+            "http://localhost/oauth/callback".to_string(),
+            StdDuration::from_secs(600),
+            StdDuration::from_secs(300),
+            50,
+        );
+        state
     }
 
     fn issue_token(

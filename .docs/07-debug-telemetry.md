@@ -34,7 +34,7 @@
 | `projector`  | 状態適用と Patch 生成                               | `core::projector`               |
 | `sse`        | SSE Hub 配信（id=version, 心拍, リング）              | `app::sse::hub`                 |
 | `storage`    | DB 操作の要所（TTL/WAL/Backfill）                   | `storage::*`                    |
-| `oauth`      | `/oauth2/validate` / refresh / 購読棚卸し         | `twitch::oauth/subscriptions`   |
+| `oauth`      | `/oauth2/validate` / refresh / Helix 同期        | `twitch::oauth` / `twitch::helix` |
 
 > **規範**：上記ステージ名は Tap/ログ/メトリクスの **label 値として固定**（**MUST**）。
 
@@ -85,6 +85,8 @@
 * **背圧**：クライアントが遅い場合、**最古イベントからドロップ**（`dropped=N` の Tap 内メトリクスを増加）。
 
 **Storage ステージ固有のメッセージ**：TTL/WAL ジョブは `stage="storage"` で `meta.message ∈ {"ttl.event_raw","ttl.command_log","wal.checkpoint"}` を publish し、`out.payload.deleted` や `out.payload.busy` などの統計を含める（MUST）。
+
+**OAuth ステージ固有のメッセージ**：`meta.message` は `oauth.login.*` / `oauth.validate.*` / `helix.update` / `helix.skipped` / `helix.failed` などで分類し、`out.payload` に `{"redemption_id":"...","result":"ok|failed|skipped","error":"prefix:slug"}` を格納する（PII マスク済み, MUST）。
 
 ### 3.3 UI（任意）
 
@@ -199,6 +201,14 @@
 * `sse_ring_size{aud}` **gauge**（現在リング保持数）
 * `sse_ring_miss_total{aud}` **counter**（リング外 → `state.replace`）
 
+**OAuth / Helix**
+
+* `oauth_validate_failures_total` **counter**（バリデーション失敗件数, `reason` ラベル）
+* `oauth_refresh_total{result}` **counter**（refresh 成否, `result ∈ {ok,failed}`）
+* `helix_redemptions_update_total{result}` **counter**（Helix `redemptions.update` の適用結果, `result ∈ {ok,failed,skipped}`）
+* `helix_redemptions_latency_seconds` **histogram**（Helix API 呼び出し時間）
+* `helix_redemptions_managed_total{managed}` **counter**（Queue 項目の managed フラグ遷移, `managed ∈ {true,false}`）
+
 **DB / TTL**
 
 * `db_ttl_deleted_total{table}` **counter** — `table ∈ {event_raw, command_log}`。TTL ジョブ 1 バッチあたりの削除件数を加算。
@@ -208,8 +218,10 @@
 **OAuth / Backfill**
 
 * `oauth_validate_failures_total` **counter**
-* `backfill_processed_total` **counter**
-* `backfill_duplicates_total` **counter**
+* `oauth_refresh_total{result}` **counter** — `result ∈ {success,failed,skipped}` を想定。
+* `backfill_processed_total` **counter**（Backfill がキューへ反映した件数）
+* `backfill_duplicates_total` **counter**（Backfill が既存行と重複しスキップした件数）
+* `StageKind::Oauth` に `helix.backfill` / `helix.backfill.error` を publish（payload には `redemption_id` / `reward_id` / `result` のみを含め、PII はマスク）
 
 **App**
 

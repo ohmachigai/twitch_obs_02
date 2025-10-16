@@ -93,9 +93,16 @@ export function applyPatch(state: ClientState, patch: Patch): ClientState {
       };
     }
     case 'redemption.updated': {
+      const { redemption_id, managed } = patch.data;
+      const queue = state.queue.map((entry) => {
+        if (entry.redemption_id === redemption_id) {
+          return { ...entry, managed };
+        }
+        return entry;
+      });
       return {
         version: patch.version,
-        queue: state.queue,
+        queue,
         counters: state.counters,
         settings: state.settings,
       };

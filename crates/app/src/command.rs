@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use metrics::counter;
+use metrics::{counter, histogram};
 use serde_json::{to_string, to_value, Value};
 use sqlx::{Sqlite, Transaction};
 use thiserror::Error;
@@ -10,17 +10,37 @@ use uuid::Uuid;
 
 use twi_overlay_core::projector::Projector;
 use twi_overlay_core::types::{
-    Command, EnqueueCommand, Patch, QueueCompleteCommand, QueueEntry, QueueEntryStatus,
-    QueueRemovalReason, QueueRemoveCommand, RedemptionUpdateCommand, Settings,
-    SettingsUpdateCommand,
+    Command, CommandResult, EnqueueCommand, Patch, QueueCompleteCommand, QueueEntry,
+    QueueEntryStatus, QueueRemovalReason, QueueRemoveCommand, RedemptionUpdateCommand,
+    RedemptionUpdateMode, Settings, SettingsUpdateCommand,
 };
 use twi_overlay_storage::{
     BroadcasterRepository, CommandLogError, DailyCounterError, DailyCounterRepository, Database,
-    NewCommandLog, NewDailyCounter, NewQueueEntry, QueueError, QueueRepository, SettingsError,
-    SettingsUpdateError,
+    NewCommandLog, NewDailyCounter, NewQueueEntry, OauthFailure, OauthLink, OauthLinkError,
+    QueueError, QueueRepository, SettingsError, SettingsUpdateError,
 };
 
+use reqwest::StatusCode;
+use twi_overlay_twitch::{HelixClient, HelixError, HelixRedemptionStatus, UpdateRedemptionRequest};
+
 use crate::tap::{StageEvent, StageKind, StageMetadata, StagePayload, TapHub};
+use tracing::{error, warn};
+
+pub(crate) const REQUIRED_OAUTH_SCOPES: &[&str] =
+    &["channel:read:redemptions", "channel:manage:redemptions"];
+const ERR_QUEUE_NOT_FOUND: &str = "queue:not-found";
+const ERR_QUEUE_NO_REDEMPTION: &str = "queue:no-redemption";
+pub(crate) const ERR_OAUTH_NOT_LINKED: &str = "oauth:not-linked";
+pub(crate) const ERR_OAUTH_REAUTH: &str = "oauth:reauth-required";
+pub(crate) const ERR_OAUTH_MISSING_SCOPE: &str = "oauth:missing-scope";
+pub(crate) const ERR_OAUTH_EXPIRED: &str = "oauth:expired";
+pub(crate) const ERR_HELIX_FORBIDDEN: &str = "twitch:forbidden";
+pub(crate) const ERR_HELIX_UNAUTHORIZED: &str = "twitch:unauthorized";
+pub(crate) const ERR_HELIX_NOT_FOUND: &str = "twitch:not-found";
+pub(crate) const ERR_HELIX_RATE_LIMIT: &str = "twitch:rate-limited";
+pub(crate) const ERR_HELIX_ERROR: &str = "twitch:error";
+pub(crate) const ERR_NETWORK_ERROR: &str = "network:error";
+pub(crate) const ERR_INTERNAL_ERROR: &str = "internal:error";
 
 #[derive(Debug, Clone)]
 pub struct CommandApplication {
@@ -64,6 +84,7 @@ pub struct CommandExecutor {
     database: Database,
     tap: TapHub,
     clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    helix: HelixClient,
 }
 
 impl CommandExecutor {
@@ -71,11 +92,13 @@ impl CommandExecutor {
         database: Database,
         tap: TapHub,
         clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+        helix: HelixClient,
     ) -> Self {
         Self {
             database,
             tap,
             clock,
+            helix,
         }
     }
 
@@ -288,8 +311,195 @@ impl CommandExecutor {
         broadcaster_id: &str,
         command: &RedemptionUpdateCommand,
     ) -> Result<CommandApplication, CommandExecutorError> {
-        let serialized = to_string(command)?;
-        let inserted_at = self.now();
+        let now = self.now();
+        let queue_repo = self.database.queue();
+        let oauth_repo = self.database.oauth_links();
+
+        let mut enriched = command.clone();
+        let managed;
+        let mut applicable = false;
+        let mut result = CommandResult::Skipped;
+        let mut error_code: Option<String> = None;
+        let mut helix_result = "skipped";
+        let mut helix_message = "helix.skipped";
+
+        if let Some(entry) = queue_repo
+            .find_entry_by_redemption_for_update(tx, broadcaster_id, &command.redemption_id)
+            .await?
+        {
+            let entry_id = entry.id.clone();
+            let entry_managed = entry.managed;
+            let mut target_managed = entry_managed;
+
+            if entry.redemption_id.is_none() {
+                error_code = Some(ERR_QUEUE_NO_REDEMPTION.to_string());
+                if target_managed {
+                    target_managed = false;
+                }
+                warn!(
+                    stage = "oauth",
+                    broadcaster = %broadcaster_id,
+                    redemption = %command.redemption_id,
+                    "queue entry missing redemption id, skipping helix update"
+                );
+            } else {
+                let oauth_link = oauth_repo
+                    .fetch_by_broadcaster_for_update(tx, broadcaster_id)
+                    .await
+                    .map_err(CommandExecutorError::from)?;
+
+                if let Some(link) = oauth_link {
+                    if link.requires_reauth {
+                        error_code = Some(ERR_OAUTH_REAUTH.to_string());
+                        if target_managed {
+                            target_managed = false;
+                        }
+                        warn!(
+                            stage = "oauth",
+                            broadcaster = %broadcaster_id,
+                            redemption = %command.redemption_id,
+                            "twitch oauth link requires reauthorization"
+                        );
+                    } else if !has_required_scopes(&link) {
+                        error_code = Some(ERR_OAUTH_MISSING_SCOPE.to_string());
+                        if target_managed {
+                            target_managed = false;
+                        }
+                        warn!(
+                            stage = "oauth",
+                            broadcaster = %broadcaster_id,
+                            redemption = %command.redemption_id,
+                            "twitch oauth link missing required scopes"
+                        );
+                    } else if link.expires_at <= now {
+                        error_code = Some(ERR_OAUTH_EXPIRED.to_string());
+                        if target_managed {
+                            target_managed = false;
+                        }
+                        warn!(
+                            stage = "oauth",
+                            broadcaster = %broadcaster_id,
+                            redemption = %command.redemption_id,
+                            "twitch oauth token expired, skipping helix update"
+                        );
+                    } else {
+                        applicable = true;
+                        let status = helix_status_from_mode(command.mode);
+                        let request = UpdateRedemptionRequest {
+                            broadcaster_id,
+                            reward_id: &entry.reward_id,
+                            redemption_id: &command.redemption_id,
+                            status,
+                        };
+
+                        let started = Instant::now();
+                        match self
+                            .helix
+                            .update_redemption(&link.access_token, &request)
+                            .await
+                        {
+                            Ok(()) => {
+                                histogram!("helix_redemptions_latency_seconds")
+                                    .record(started.elapsed().as_secs_f64());
+                                helix_result = "ok";
+                                helix_message = "helix.update";
+                                result = CommandResult::Ok;
+                                if !target_managed {
+                                    target_managed = true;
+                                }
+                            }
+                            Err(err) => {
+                                histogram!("helix_redemptions_latency_seconds")
+                                    .record(started.elapsed().as_secs_f64());
+                                let (code, requires_reauth) = classify_helix_error(&err);
+                                helix_result = "failed";
+                                helix_message = "helix.failed";
+                                result = CommandResult::Failed;
+                                error_code = Some(code.to_string());
+                                if target_managed {
+                                    target_managed = false;
+                                }
+                                error!(
+                                    stage = "oauth",
+                                    broadcaster = %broadcaster_id,
+                                    redemption = %command.redemption_id,
+                                    error = %err,
+                                    "helix redemption update failed"
+                                );
+                                if let Err(mark_err) = oauth_repo
+                                    .mark_failure(
+                                        tx,
+                                        &OauthFailure {
+                                            broadcaster_id,
+                                            twitch_user_id: link.twitch_user_id.clone(),
+                                            occurred_at: now,
+                                            reason: code,
+                                            requires_reauth,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        stage = "oauth",
+                                        broadcaster = %broadcaster_id,
+                                        error = %mark_err,
+                                        "failed to persist oauth failure after helix error"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    error_code = Some(ERR_OAUTH_NOT_LINKED.to_string());
+                    if target_managed {
+                        target_managed = false;
+                    }
+                    warn!(
+                        stage = "oauth",
+                        broadcaster = %broadcaster_id,
+                        redemption = %command.redemption_id,
+                        "no oauth link found for broadcaster"
+                    );
+                }
+            }
+
+            if target_managed != entry_managed {
+                queue_repo
+                    .update_managed(tx, broadcaster_id, &entry_id, target_managed, now)
+                    .await
+                    .map_err(CommandExecutorError::from)?;
+                counter!(
+                    "helix_redemptions_managed_total",
+                    "managed" => if target_managed { "true" } else { "false" }
+                )
+                .increment(1);
+            }
+
+            managed = target_managed;
+        } else {
+            error_code = Some(ERR_QUEUE_NOT_FOUND.to_string());
+            managed = false;
+            warn!(
+                stage = "oauth",
+                broadcaster = %broadcaster_id,
+                redemption = %command.redemption_id,
+                "no queue entry found for helix update"
+            );
+        }
+
+        counter!(
+            "helix_redemptions_update_total",
+            "result" => helix_result
+        )
+        .increment(1);
+
+        enriched.applicable = applicable;
+        enriched.result = result;
+        enriched.error = error_code.clone();
+        enriched.managed = Some(managed);
+
+        let serialized = to_string(&enriched)?;
+        let inserted_at = now;
         let version = self
             .append_command(
                 tx,
@@ -301,7 +511,7 @@ impl CommandExecutor {
             )
             .await?;
 
-        let command_enum = Command::RedemptionUpdate(command.clone());
+        let command_enum = Command::RedemptionUpdate(enriched.clone());
         self.emit_command_event(
             broadcaster_id,
             version,
@@ -310,9 +520,17 @@ impl CommandExecutor {
             None,
         );
 
-        let patch = Projector::redemption_updated(version, command.issued_at, command);
+        let patch = Projector::redemption_updated(version, enriched.issued_at, &enriched);
         self.emit_projector_event(broadcaster_id, version, &patch, &command_enum, None);
         counter!("projector_patches_total", "type" => patch.kind_str()).increment(1);
+
+        let oauth_payload = serde_json::json!({
+            "redemption_id": command.redemption_id,
+            "result": helix_result,
+            "managed": managed,
+            "error": error_code,
+        });
+        self.emit_oauth_event(broadcaster_id, helix_message, oauth_payload);
 
         Ok(CommandApplication {
             version,
@@ -708,6 +926,28 @@ impl CommandExecutor {
         self.tap.publish(event);
     }
 
+    fn emit_oauth_event(&self, broadcaster_id: &str, message: &str, payload: Value) {
+        let event = StageEvent {
+            ts: self.now(),
+            stage: StageKind::Oauth,
+            trace_id: None,
+            op_id: None,
+            version: None,
+            broadcaster_id: Some(broadcaster_id.to_string()),
+            meta: StageMetadata {
+                message: Some(message.to_string()),
+                ..StageMetadata::default()
+            },
+            r#in: StagePayload::default(),
+            out: StagePayload {
+                redacted: true,
+                payload,
+                truncated: None,
+            },
+        };
+        self.tap.publish(event);
+    }
+
     fn emit_projector_event(
         &self,
         broadcaster_id: &str,
@@ -836,6 +1076,33 @@ fn normalize_idempotent_payload(payload_json: &str) -> Result<Value, CommandExec
     Ok(value)
 }
 
+pub(crate) fn has_required_scopes(link: &OauthLink) -> bool {
+    REQUIRED_OAUTH_SCOPES
+        .iter()
+        .all(|required| link.managed_scopes.iter().any(|scope| scope == required))
+}
+
+fn helix_status_from_mode(mode: RedemptionUpdateMode) -> HelixRedemptionStatus {
+    match mode {
+        RedemptionUpdateMode::Consume => HelixRedemptionStatus::Fulfilled,
+        RedemptionUpdateMode::Refund => HelixRedemptionStatus::Canceled,
+    }
+}
+
+pub(crate) fn classify_helix_error(err: &HelixError) -> (&'static str, bool) {
+    match err {
+        HelixError::Status { status, .. } => match *status {
+            StatusCode::UNAUTHORIZED => (ERR_HELIX_UNAUTHORIZED, true),
+            StatusCode::FORBIDDEN => (ERR_HELIX_FORBIDDEN, false),
+            StatusCode::NOT_FOUND => (ERR_HELIX_NOT_FOUND, false),
+            StatusCode::TOO_MANY_REQUESTS => (ERR_HELIX_RATE_LIMIT, false),
+            _ => (ERR_HELIX_ERROR, false),
+        },
+        HelixError::Http(_) => (ERR_NETWORK_ERROR, false),
+        HelixError::Url(_) => (ERR_INTERNAL_ERROR, false),
+    }
+}
+
 pub fn compute_local_day(
     occurred_at: DateTime<Utc>,
     timezone: &str,
@@ -863,6 +1130,8 @@ pub enum CommandExecutorError {
     SettingsUpdate(#[from] SettingsUpdateError),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("oauth link error: {0}")]
+    OauthLink(#[from] OauthLinkError),
     #[error("invalid timezone: {0}")]
     InvalidTimezone(String),
     #[error("op_id conflict for command: {op_id}")]
@@ -877,13 +1146,20 @@ pub enum CommandExecutorError {
 mod tests {
     use super::*;
     use crate::tap::TapHub;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use httpmock::prelude::*;
+    use httpmock::Method::PATCH;
+    use reqwest::Client;
     use serde_json::json;
     use twi_overlay_core::types::{
         CommandResult, CommandSource, NormalizedReward, NormalizedUser, RedemptionUpdateMode,
     };
+    use twi_overlay_storage::NewOauthLink;
+    use twi_overlay_twitch::HelixClient;
+    use url::Url;
     use uuid::Uuid;
 
-    async fn setup_executor() -> CommandExecutor {
+    async fn setup_executor_with_helix(helix_client: HelixClient) -> CommandExecutor {
         let database = Database::connect("sqlite::memory:?cache=shared")
             .await
             .expect("connect");
@@ -900,8 +1176,16 @@ mod tests {
         .execute(database.pool())
         .await
         .expect("insert state index");
+        CommandExecutor::new(database, TapHub::new(), Arc::new(Utc::now), helix_client)
+    }
 
-        CommandExecutor::new(database, TapHub::new(), Arc::new(Utc::now))
+    async fn setup_executor() -> CommandExecutor {
+        let helix_client = HelixClient::new(
+            "client",
+            Url::parse("http://localhost/").expect("helix url"),
+            Client::builder().build().expect("helix client"),
+        );
+        setup_executor_with_helix(helix_client).await
     }
 
     fn enqueue_command() -> Command {
@@ -954,6 +1238,7 @@ mod tests {
             mode: RedemptionUpdateMode::Consume,
             applicable: true,
             result: CommandResult::Skipped,
+            managed: None,
             error: None,
         });
         let patches = executor
@@ -962,6 +1247,280 @@ mod tests {
             .expect("execute");
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0].kind_str(), "redemption.updated");
+    }
+
+    #[tokio::test]
+    async fn redemption_update_calls_helix_and_sets_managed() {
+        let server = MockServer::start_async().await;
+        let helix_client = HelixClient::new(
+            "client",
+            Url::parse(&(server.base_url() + "/")).expect("helix url"),
+            Client::builder().build().expect("helix client"),
+        );
+        let executor = setup_executor_with_helix(helix_client).await;
+        let database = executor.database.clone();
+
+        let now = Utc::now();
+        let command_log = database.command_log();
+        let mut tx = command_log.begin().await.expect("begin oauth tx");
+        database
+            .oauth_links()
+            .upsert_link(
+                &mut tx,
+                &NewOauthLink {
+                    id: Uuid::new_v4().to_string(),
+                    broadcaster_id: "b-1",
+                    twitch_user_id: "t-1".to_string(),
+                    scopes: vec![
+                        "channel:read:redemptions".into(),
+                        "channel:manage:redemptions".into(),
+                    ],
+                    managed_scopes: vec![
+                        "channel:read:redemptions".into(),
+                        "channel:manage:redemptions".into(),
+                    ],
+                    access_token: "access-token".into(),
+                    refresh_token: "refresh-token".into(),
+                    expires_at: now + ChronoDuration::hours(1),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("insert oauth link");
+        tx.commit().await.expect("commit oauth link");
+
+        let enqueue = Command::Enqueue(EnqueueCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: now,
+            source: CommandSource::Policy,
+            user: NormalizedUser {
+                id: "u-1".to_string(),
+                login: Some("alice".to_string()),
+                display_name: Some("Alice".to_string()),
+            },
+            reward: NormalizedReward {
+                id: "reward-1".to_string(),
+                title: Some("Join".to_string()),
+                cost: Some(1),
+            },
+            redemption_id: "red-helix".to_string(),
+            managed: Some(false),
+        });
+        executor
+            .execute("b-1", "UTC", &[enqueue])
+            .await
+            .expect("enqueue");
+
+        let patch_mock = server
+            .mock_async(|when, then| {
+                when.method(PATCH)
+                    .path("/channel_points/custom_rewards/redemptions")
+                    .query_param("broadcaster_id", "b-1")
+                    .query_param("reward_id", "reward-1")
+                    .query_param("id", "red-helix");
+                then.status(200);
+            })
+            .await;
+
+        let update = Command::RedemptionUpdate(RedemptionUpdateCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: now,
+            source: CommandSource::Policy,
+            redemption_id: "red-helix".to_string(),
+            mode: RedemptionUpdateMode::Consume,
+            applicable: false,
+            result: CommandResult::Skipped,
+            managed: None,
+            error: None,
+        });
+        let patches = executor
+            .execute("b-1", "UTC", &[update])
+            .await
+            .expect("execute helix");
+
+        patch_mock.assert_async().await;
+
+        let patch = &patches[0];
+        assert_eq!(patch.kind_str(), "redemption.updated");
+        assert_eq!(patch.data["managed"].as_bool(), Some(true));
+        assert_eq!(patch.data["result"].as_str(), Some("ok"));
+        assert!(patch.data.get("error").is_none());
+
+        let command_log = database.command_log();
+        let mut tx = command_log.begin().await.expect("begin verify");
+        let entry = database
+            .queue()
+            .find_entry_by_redemption_for_update(&mut tx, "b-1", "red-helix")
+            .await
+            .expect("find entry")
+            .expect("entry present");
+        assert!(entry.managed);
+    }
+
+    #[tokio::test]
+    async fn redemption_update_skips_without_oauth_link() {
+        let server = MockServer::start_async().await;
+        let helix_client = HelixClient::new(
+            "client",
+            Url::parse(&(server.base_url() + "/")).expect("helix url"),
+            Client::builder().build().expect("helix client"),
+        );
+        let executor = setup_executor_with_helix(helix_client).await;
+
+        let enqueue = Command::Enqueue(EnqueueCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: Utc::now(),
+            source: CommandSource::Policy,
+            user: NormalizedUser {
+                id: "u-1".to_string(),
+                login: Some("alice".to_string()),
+                display_name: Some("Alice".to_string()),
+            },
+            reward: NormalizedReward {
+                id: "reward-1".to_string(),
+                title: Some("Join".to_string()),
+                cost: Some(1),
+            },
+            redemption_id: "red-skip".to_string(),
+            managed: Some(false),
+        });
+        executor
+            .execute("b-1", "UTC", &[enqueue])
+            .await
+            .expect("enqueue");
+
+        let patch_mock = server
+            .mock_async(|when, then| {
+                when.method(PATCH)
+                    .path("/channel_points/custom_rewards/redemptions")
+                    .query_param("broadcaster_id", "b-1")
+                    .query_param("reward_id", "reward-1")
+                    .query_param("id", "red-skip");
+                then.status(200);
+            })
+            .await;
+
+        let update = Command::RedemptionUpdate(RedemptionUpdateCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: Utc::now(),
+            source: CommandSource::Policy,
+            redemption_id: "red-skip".to_string(),
+            mode: RedemptionUpdateMode::Consume,
+            applicable: true,
+            result: CommandResult::Skipped,
+            managed: None,
+            error: None,
+        });
+        let patches = executor
+            .execute("b-1", "UTC", &[update])
+            .await
+            .expect("execute");
+
+        patch_mock.assert_hits_async(0).await;
+
+        let patch = &patches[0];
+        assert_eq!(patch.data["managed"].as_bool(), Some(false));
+        assert_eq!(patch.data["result"].as_str(), Some("skipped"));
+        assert_eq!(patch.data["error"].as_str(), Some(ERR_OAUTH_NOT_LINKED));
+    }
+
+    #[tokio::test]
+    async fn redemption_update_helix_failure_records_error() {
+        let server = MockServer::start_async().await;
+        let helix_client = HelixClient::new(
+            "client",
+            Url::parse(&(server.base_url() + "/")).expect("helix url"),
+            Client::builder().build().expect("helix client"),
+        );
+        let executor = setup_executor_with_helix(helix_client).await;
+        let database = executor.database.clone();
+
+        let now = Utc::now();
+        let command_log = database.command_log();
+        let mut tx = command_log.begin().await.expect("begin oauth tx");
+        database
+            .oauth_links()
+            .upsert_link(
+                &mut tx,
+                &NewOauthLink {
+                    id: Uuid::new_v4().to_string(),
+                    broadcaster_id: "b-1",
+                    twitch_user_id: "t-1".to_string(),
+                    scopes: vec![
+                        "channel:read:redemptions".into(),
+                        "channel:manage:redemptions".into(),
+                    ],
+                    managed_scopes: vec![
+                        "channel:read:redemptions".into(),
+                        "channel:manage:redemptions".into(),
+                    ],
+                    access_token: "access-token".into(),
+                    refresh_token: "refresh-token".into(),
+                    expires_at: now + ChronoDuration::hours(1),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("insert oauth link");
+        tx.commit().await.expect("commit oauth link");
+
+        let enqueue = Command::Enqueue(EnqueueCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: now,
+            source: CommandSource::Policy,
+            user: NormalizedUser {
+                id: "u-1".to_string(),
+                login: Some("alice".to_string()),
+                display_name: Some("Alice".to_string()),
+            },
+            reward: NormalizedReward {
+                id: "reward-1".to_string(),
+                title: Some("Join".to_string()),
+                cost: Some(1),
+            },
+            redemption_id: "red-fail".to_string(),
+            managed: Some(true),
+        });
+        executor
+            .execute("b-1", "UTC", &[enqueue])
+            .await
+            .expect("enqueue");
+
+        let patch_mock = server
+            .mock_async(|when, then| {
+                when.method(PATCH)
+                    .path("/channel_points/custom_rewards/redemptions")
+                    .query_param("broadcaster_id", "b-1")
+                    .query_param("reward_id", "reward-1")
+                    .query_param("id", "red-fail");
+                then.status(401);
+            })
+            .await;
+
+        let update = Command::RedemptionUpdate(RedemptionUpdateCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: now,
+            source: CommandSource::Policy,
+            redemption_id: "red-fail".to_string(),
+            mode: RedemptionUpdateMode::Consume,
+            applicable: true,
+            result: CommandResult::Ok,
+            managed: None,
+            error: None,
+        });
+        let patches = executor
+            .execute("b-1", "UTC", &[update])
+            .await
+            .expect("execute fail");
+
+        patch_mock.assert_async().await;
+
+        let patch = &patches[0];
+        assert_eq!(patch.data["managed"].as_bool(), Some(false));
+        assert_eq!(patch.data["result"].as_str(), Some("failed"));
+        assert_eq!(patch.data["error"].as_str(), Some(ERR_HELIX_UNAUTHORIZED));
     }
 
     #[tokio::test]
