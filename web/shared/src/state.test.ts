@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { applyPatch, createClientState, VersionMismatchError } from './state';
-import type { Patch, QueueEntry, StateSnapshot } from './types';
+import type { Patch, QueueEntry, SettingsPatch, StateSnapshot } from './types';
 
-describe('state helpers', () => {
+describe('shared state helpers', () => {
   const baseSnapshot: StateSnapshot = {
     version: 10,
     queue: [
@@ -58,7 +58,7 @@ describe('state helpers', () => {
       type: 'queue.removed',
       version: 11,
       at: '2024-01-01T10:10:00Z',
-      data: { entry_id: 'entry-1' },
+      data: { entry_id: 'entry-1', reason: 'UNDO', user_today_count: 0 },
     };
     const next = applyPatch(state, patch);
     expect(next.queue.map((entry) => entry.id)).toEqual(['entry-2']);
@@ -70,7 +70,7 @@ describe('state helpers', () => {
       type: 'queue.removed',
       version: 15,
       at: '2024-01-01T10:10:00Z',
-      data: { entry_id: 'entry-1' },
+      data: { entry_id: 'entry-1', reason: 'UNDO', user_today_count: 0 },
     };
 
     expect(() => applyPatch(state, patch)).toThrow(VersionMismatchError);
@@ -96,6 +96,27 @@ describe('state helpers', () => {
     expect(next.version).toBe(25);
     expect(next.queue).toHaveLength(1);
     expect(next.queue[0].id).toBe('entry-9');
+  });
+
+  it('merges nested policy settings on settings.updated', () => {
+    const state = createClientState(baseSnapshot);
+    const patchPayload: SettingsPatch = {
+      group_size: 3,
+      policy: {
+        duplicate_policy: 'refund',
+      },
+    };
+    const patch: Patch = {
+      type: 'settings.updated',
+      version: 11,
+      at: '2024-01-01T10:15:00Z',
+      data: { patch: patchPayload },
+    };
+
+    const next = applyPatch(state, patch);
+    expect(next.settings.group_size).toBe(3);
+    expect(next.settings.policy.duplicate_policy).toBe('refund');
+    expect(next.settings.policy.target_rewards).toEqual([]);
   });
 });
 

@@ -1,3 +1,5 @@
+export type QueueEntryStatus = 'QUEUED' | 'COMPLETED' | 'REMOVED';
+
 export interface QueueEntry {
   id: string;
   broadcaster_id: string;
@@ -8,7 +10,7 @@ export interface QueueEntry {
   reward_id: string;
   redemption_id?: string;
   enqueued_at: string;
-  status: 'QUEUED' | 'COMPLETED' | 'REMOVED';
+  status: QueueEntryStatus;
   status_reason?: string;
   managed: boolean;
   last_updated_at: string;
@@ -35,6 +37,10 @@ export interface Settings {
   policy: PolicySettings;
 }
 
+export type SettingsPatch = Partial<Omit<Settings, 'policy'>> & {
+  policy?: Partial<PolicySettings>;
+};
+
 export interface StateSnapshot {
   version: number;
   queue: QueueEntry[];
@@ -52,8 +58,21 @@ export interface QueueEnqueuedPatch {
   };
 }
 
+export type QueueRemovalReason = 'UNDO' | 'EXPLICIT_REMOVE' | 'STREAM_START_CLEAR';
+
 export interface QueueRemovedPatch {
-  type: 'queue.removed' | 'queue.completed';
+  type: 'queue.removed';
+  version: number;
+  at: string;
+  data: {
+    entry_id: string;
+    reason: QueueRemovalReason;
+    user_today_count: number;
+  };
+}
+
+export interface QueueCompletedPatch {
+  type: 'queue.completed';
   version: number;
   at: string;
   data: {
@@ -76,7 +95,7 @@ export interface SettingsUpdatedPatch {
   version: number;
   at: string;
   data: {
-    settings: Settings;
+    patch: SettingsPatch;
   };
 }
 
@@ -104,6 +123,7 @@ export interface StateReplacePatch {
 export type Patch =
   | QueueEnqueuedPatch
   | QueueRemovedPatch
+  | QueueCompletedPatch
   | CounterUpdatedPatch
   | SettingsUpdatedPatch
   | RedemptionUpdatedPatch

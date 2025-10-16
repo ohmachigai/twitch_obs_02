@@ -11,13 +11,18 @@ use axum::{
 use chrono::{DateTime, Utc};
 use metrics::counter;
 use metrics_exporter_prometheus::PrometheusHandle;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tracing::{error, info};
 use twi_overlay_core::policy::PolicyEngine;
-use twi_overlay_storage::{Database, SettingsError};
+use twi_overlay_core::types::{
+    Command, CommandSource, Patch, QueueCompleteCommand, QueueRemovalReason, QueueRemoveCommand,
+    SettingsUpdateCommand,
+};
+use twi_overlay_storage::{Database, QueueError, SettingsError};
+use uuid::Uuid;
 
-use crate::command::CommandExecutor;
+use crate::command::{CommandApplyResult, CommandExecutor, CommandExecutorError};
 use crate::problem::ProblemResponse;
 use crate::sse::{Audience, SseHub, SseStream, SseTokenValidator, TokenError};
 use crate::state::{build_state_snapshot, StateScope};
@@ -25,6 +30,7 @@ use crate::tap::{
     parse_stage_list, tap_keep_alive, tap_stream, StageEvent, StageKind, StageMetadata,
     StagePayload, TapFilter, TapHub,
 };
+use crate::webhook::emit_sse_stage;
 use crate::{telemetry, webhook};
 use twi_overlay_core::types::StateSnapshot;
 
@@ -128,6 +134,8 @@ pub fn app_router(state: AppState) -> Router {
         .route("/overlay/sse", get(overlay_sse))
         .route("/admin/sse", get(admin_sse))
         .route("/api/state", get(state_snapshot))
+        .route("/api/queue/dequeue", post(queue_dequeue))
+        .route("/api/settings/update", post(settings_update))
         .route("/eventsub/webhook", post(webhook::handle))
         .with_state(state)
 }
@@ -171,6 +179,61 @@ struct StateQuery {
     since: Option<String>,
     #[serde(default)]
     token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueDequeueRequest {
+    broadcaster: String,
+    entry_id: String,
+    mode: QueueDequeueMode,
+    op_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum QueueDequeueMode {
+    Complete,
+    Undo,
+}
+
+impl QueueDequeueMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            QueueDequeueMode::Complete => "COMPLETE",
+            QueueDequeueMode::Undo => "UNDO",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct QueueDequeueResultBody {
+    entry_id: String,
+    mode: String,
+    user_today_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueDequeueResponse {
+    version: u64,
+    result: QueueDequeueResultBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingsUpdateRequest {
+    broadcaster: String,
+    patch: Value,
+    op_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsUpdateResultBody {
+    applied: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsUpdateResponse {
+    version: u64,
+    result: SettingsUpdateResultBody,
 }
 
 async fn debug_tap(
@@ -345,6 +408,274 @@ async fn state_snapshot(
     Ok(Json(snapshot))
 }
 
+async fn queue_dequeue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<QueueDequeueRequest>,
+) -> Result<Json<QueueDequeueResponse>, ProblemResponse> {
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        counter!("api_queue_dequeue_requests_total", 1, "result" => "unauthorized");
+        ProblemResponse::new(
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+            "queue dequeue endpoint requires a bearer token",
+        )
+    })?;
+
+    if Uuid::parse_str(&payload.op_id).is_err() {
+        counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+        return Err(ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_op_id",
+            "op_id must be a valid UUID",
+        ));
+    }
+
+    let now = state.now();
+    if let Err(err) =
+        state
+            .token_validator()
+            .validate(token, Audience::Admin, &payload.broadcaster, now)
+    {
+        counter!("api_queue_dequeue_requests_total", 1, "result" => "unauthorized");
+        return Err(problem_for_token_error(err));
+    }
+
+    let profile = match state
+        .storage()
+        .broadcasters()
+        .fetch_settings(&payload.broadcaster)
+        .await
+    {
+        Ok(profile) => profile,
+        Err(SettingsError::NotFound) => {
+            counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+            return Err(ProblemResponse::new(
+                StatusCode::NOT_FOUND,
+                "broadcaster_not_found",
+                "broadcaster is not provisioned",
+            ));
+        }
+        Err(err) => {
+            counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+            error!(
+                stage = "mutation",
+                broadcaster = %payload.broadcaster,
+                error = %err,
+                "failed to load broadcaster settings",
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_error",
+                "failed to load broadcaster settings",
+            ));
+        }
+    };
+
+    let command = match payload.mode {
+        QueueDequeueMode::Complete => Command::QueueComplete(QueueCompleteCommand {
+            broadcaster_id: payload.broadcaster.clone(),
+            issued_at: now,
+            source: CommandSource::Admin,
+            entry_id: payload.entry_id.clone(),
+            op_id: payload.op_id.clone(),
+        }),
+        QueueDequeueMode::Undo => Command::QueueRemove(QueueRemoveCommand {
+            broadcaster_id: payload.broadcaster.clone(),
+            issued_at: now,
+            source: CommandSource::Admin,
+            entry_id: payload.entry_id.clone(),
+            reason: QueueRemovalReason::Undo,
+            op_id: payload.op_id.clone(),
+        }),
+    };
+
+    let application = match state
+        .command_executor()
+        .execute_admin_command(&payload.broadcaster, &profile.timezone, command)
+        .await
+    {
+        Ok(application) => application,
+        Err(err) => {
+            let (problem, label) = queue_error_response(&payload, err);
+            counter!("api_queue_dequeue_requests_total", 1, "result" => label);
+            return Err(problem);
+        }
+    };
+
+    broadcast_patches(&state, &payload.broadcaster, &application.patches).await;
+
+    let (entry_id, mode, user_today_count) = match application.result {
+        CommandApplyResult::QueueMutation {
+            entry_id,
+            mode,
+            user_today_count,
+        } => (entry_id, mode, user_today_count),
+        other => {
+            counter!("api_queue_dequeue_requests_total", 1, "result" => "error");
+            error!(
+                stage = "mutation",
+                broadcaster = %payload.broadcaster,
+                mode = payload.mode.as_str(),
+                op_id = %payload.op_id,
+                result = ?other,
+                "unexpected command result for queue dequeue",
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_result",
+                "executor returned unexpected result",
+            ));
+        }
+    };
+
+    counter!("api_queue_dequeue_requests_total", 1, "result" => "ok");
+    info!(
+        stage = "mutation",
+        kind = "queue.dequeue",
+        broadcaster = %payload.broadcaster,
+        entry_id = %entry_id,
+        mode = mode.as_str(),
+        op_id = %payload.op_id,
+        duplicate = application.duplicate,
+        version = application.version,
+        user_today_count,
+        "queue entry updated via admin mutation",
+    );
+
+    Ok(Json(QueueDequeueResponse {
+        version: application.version,
+        result: QueueDequeueResultBody {
+            entry_id,
+            mode: mode.as_str().to_string(),
+            user_today_count,
+        },
+    }))
+}
+
+async fn settings_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SettingsUpdateRequest>,
+) -> Result<Json<SettingsUpdateResponse>, ProblemResponse> {
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        counter!("api_settings_update_requests_total", 1, "result" => "unauthorized");
+        ProblemResponse::new(
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+            "settings update endpoint requires a bearer token",
+        )
+    })?;
+
+    if Uuid::parse_str(&payload.op_id).is_err() {
+        counter!("api_settings_update_requests_total", 1, "result" => "error");
+        return Err(ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_op_id",
+            "op_id must be a valid UUID",
+        ));
+    }
+
+    let now = state.now();
+    if let Err(err) =
+        state
+            .token_validator()
+            .validate(token, Audience::Admin, &payload.broadcaster, now)
+    {
+        counter!("api_settings_update_requests_total", 1, "result" => "unauthorized");
+        return Err(problem_for_token_error(err));
+    }
+
+    let profile = match state
+        .storage()
+        .broadcasters()
+        .fetch_settings(&payload.broadcaster)
+        .await
+    {
+        Ok(profile) => profile,
+        Err(SettingsError::NotFound) => {
+            counter!("api_settings_update_requests_total", 1, "result" => "error");
+            return Err(ProblemResponse::new(
+                StatusCode::NOT_FOUND,
+                "broadcaster_not_found",
+                "broadcaster is not provisioned",
+            ));
+        }
+        Err(err) => {
+            counter!("api_settings_update_requests_total", 1, "result" => "error");
+            error!(
+                stage = "mutation",
+                broadcaster = %payload.broadcaster,
+                error = %err,
+                "failed to load broadcaster settings",
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_error",
+                "failed to load broadcaster settings",
+            ));
+        }
+    };
+
+    let command = Command::SettingsUpdate(SettingsUpdateCommand {
+        broadcaster_id: payload.broadcaster.clone(),
+        issued_at: now,
+        source: CommandSource::Admin,
+        patch: payload.patch.clone(),
+        op_id: payload.op_id.clone(),
+    });
+
+    let application = match state
+        .command_executor()
+        .execute_admin_command(&payload.broadcaster, &profile.timezone, command)
+        .await
+    {
+        Ok(application) => application,
+        Err(err) => {
+            let (problem, label) = settings_error_response(&payload, err);
+            counter!("api_settings_update_requests_total", 1, "result" => label);
+            return Err(problem);
+        }
+    };
+
+    broadcast_patches(&state, &payload.broadcaster, &application.patches).await;
+
+    let applied = match application.result {
+        CommandApplyResult::SettingsUpdated { applied } => applied,
+        other => {
+            counter!("api_settings_update_requests_total", 1, "result" => "error");
+            error!(
+                stage = "mutation",
+                broadcaster = %payload.broadcaster,
+                op_id = %payload.op_id,
+                result = ?other,
+                "unexpected command result for settings update",
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_result",
+                "executor returned unexpected result",
+            ));
+        }
+    };
+
+    counter!("api_settings_update_requests_total", 1, "result" => "ok");
+    info!(
+        stage = "mutation",
+        kind = "settings.update",
+        broadcaster = %payload.broadcaster,
+        op_id = %payload.op_id,
+        duplicate = application.duplicate,
+        version = application.version,
+        "settings updated via admin mutation",
+    );
+
+    Ok(Json(SettingsUpdateResponse {
+        version: application.version,
+        result: SettingsUpdateResultBody { applied },
+    }))
+}
+
 async fn sse_handler(
     state: AppState,
     query: SseQuery,
@@ -431,6 +762,203 @@ fn parse_types(raw: Option<String>) -> Result<Option<HashSet<String>>, (StatusCo
     Ok(Some(set))
 }
 
+async fn broadcast_patches(state: &AppState, broadcaster_id: &str, patches: &[Patch]) {
+    for patch in patches {
+        if let Err(err) = state
+            .sse()
+            .broadcast_patch(broadcaster_id, patch, state.now())
+            .await
+        {
+            error!(
+                stage = "sse",
+                broadcaster = %broadcaster_id,
+                error = %err,
+                "failed to broadcast patch",
+            );
+            continue;
+        }
+        emit_sse_stage(state, broadcaster_id, patch);
+    }
+}
+
+fn queue_error_response(
+    request: &QueueDequeueRequest,
+    err: CommandExecutorError,
+) -> (ProblemResponse, &'static str) {
+    match err {
+        CommandExecutorError::Queue(QueueError::NotFound) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entry_id = %request.entry_id,
+                mode = request.mode.as_str(),
+                "queue entry not found",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::NOT_FOUND,
+                    "queue_entry_not_found",
+                    "queue entry not found",
+                ),
+                "not_found",
+            )
+        }
+        CommandExecutorError::Queue(QueueError::InvalidTransition(status)) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entry_id = %request.entry_id,
+                mode = request.mode.as_str(),
+                status = ?status,
+                "queue entry is not queued",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::CONFLICT,
+                    "invalid_transition",
+                    format!("queue entry is not queued (current={status:?})"),
+                ),
+                "conflict",
+            )
+        }
+        CommandExecutorError::OpConflict { op_id } => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entry_id = %request.entry_id,
+                op_id = %op_id,
+                "op_id conflict for queue dequeue",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::PRECONDITION_FAILED,
+                    "op_conflict",
+                    "op_id already used with different payload",
+                ),
+                "conflict",
+            )
+        }
+        CommandExecutorError::InvalidTimezone(detail) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entry_id = %request.entry_id,
+                detail = %detail,
+                "invalid timezone while processing queue dequeue",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid_timezone",
+                    detail,
+                ),
+                "error",
+            )
+        }
+        CommandExecutorError::Settings(SettingsError::NotFound) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entry_id = %request.entry_id,
+                "broadcaster missing during queue dequeue",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::NOT_FOUND,
+                    "broadcaster_not_found",
+                    "broadcaster is not provisioned",
+                ),
+                "error",
+            )
+        }
+        other => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entry_id = %request.entry_id,
+                mode = request.mode.as_str(),
+                error = %other,
+                "failed to execute queue dequeue",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "command_error",
+                    "failed to execute queue dequeue",
+                ),
+                "error",
+            )
+        }
+    }
+}
+
+fn settings_error_response(
+    request: &SettingsUpdateRequest,
+    err: CommandExecutorError,
+) -> (ProblemResponse, &'static str) {
+    match err {
+        CommandExecutorError::OpConflict { op_id } => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                op_id = %op_id,
+                "op_id conflict for settings update",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::PRECONDITION_FAILED,
+                    "op_conflict",
+                    "op_id already used with different payload",
+                ),
+                "conflict",
+            )
+        }
+        CommandExecutorError::InvalidSettingsPatch(detail) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                detail = %detail,
+                "invalid settings patch",
+            );
+            (
+                ProblemResponse::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_patch", detail),
+                "error",
+            )
+        }
+        CommandExecutorError::Settings(SettingsError::NotFound) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                "broadcaster missing during settings update",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::NOT_FOUND,
+                    "broadcaster_not_found",
+                    "broadcaster is not provisioned",
+                ),
+                "error",
+            )
+        }
+        other => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                error = %other,
+                "failed to execute settings update",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "command_error",
+                    "failed to execute settings update",
+                ),
+                "error",
+            )
+        }
+    }
+}
+
 fn problem_for_token_error(err: TokenError) -> ProblemResponse {
     ProblemResponse::new(StatusCode::FORBIDDEN, "invalid_token", err.to_string())
 }
@@ -484,7 +1012,7 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{HeaderValue, Request, StatusCode},
+        http::{HeaderValue, Method, Request, StatusCode},
     };
     use chrono::{Duration as ChronoDuration, SecondsFormat, TimeZone};
     use http_body_util::BodyExt;
@@ -498,6 +1026,7 @@ mod tests {
 
     use crate::sse::TokenClaims;
     use crate::tap::StageEvent;
+    use twi_overlay_core::types::{QueueEntryStatus, Settings};
 
     async fn setup_state() -> AppState {
         let metrics = telemetry::init_metrics().expect("metrics init");
@@ -892,5 +1421,187 @@ mod tests {
             counters[0].get("user_id").and_then(Value::as_str),
             Some("user-2")
         );
+    }
+
+    #[tokio::test]
+    async fn queue_dequeue_complete_succeeds() {
+        let fixed_now = Utc::now();
+        let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
+        provision_broadcaster(&state, 1).await;
+        insert_queue_entry(&state, "entry-1", "user-1", fixed_now, fixed_now).await;
+        insert_counter(&state, "user-1", 2, fixed_now).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Admin.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let op_id = Uuid::new_v4();
+        let body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "entry_id": "entry-1",
+            "mode": "COMPLETE",
+            "op_id": op_id,
+        }))
+        .expect("serialize body");
+
+        let response = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/dequeue")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["result"]["mode"].as_str(), Some("COMPLETE"));
+
+        let status: (String,) =
+            sqlx::query_as("SELECT status FROM queue_entries WHERE id = 'entry-1'")
+                .fetch_one(state.storage().pool())
+                .await
+                .expect("entry status");
+        assert_eq!(status.0, QueueEntryStatus::Completed.as_str());
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT count FROM daily_counters WHERE user_id = 'user-1'")
+                .fetch_one(state.storage().pool())
+                .await
+                .expect("counter");
+        assert_eq!(count.0, 2);
+    }
+
+    #[tokio::test]
+    async fn queue_dequeue_undo_decrements_counter() {
+        let fixed_now = Utc::now();
+        let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
+        provision_broadcaster(&state, 1).await;
+        insert_queue_entry(&state, "entry-1", "user-1", fixed_now, fixed_now).await;
+        insert_counter(&state, "user-1", 3, fixed_now).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Admin.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let op_id = Uuid::new_v4();
+        let body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "entry_id": "entry-1",
+            "mode": "UNDO",
+            "op_id": op_id,
+        }))
+        .expect("serialize body");
+
+        let response = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/dequeue")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["result"]["mode"].as_str(), Some("UNDO"));
+        assert_eq!(json["result"]["user_today_count"].as_u64(), Some(2));
+
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, status_reason FROM queue_entries WHERE id = 'entry-1'")
+                .fetch_one(state.storage().pool())
+                .await
+                .expect("entry status");
+        assert_eq!(row.0, QueueEntryStatus::Removed.as_str());
+        assert_eq!(row.1.as_deref(), Some(QueueRemovalReason::Undo.as_str()));
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT count FROM daily_counters WHERE user_id = 'user-1'")
+                .fetch_one(state.storage().pool())
+                .await
+                .expect("counter");
+        assert_eq!(count.0, 2);
+
+        let conflict_body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "entry_id": "entry-1",
+            "mode": "COMPLETE",
+            "op_id": op_id,
+        }))
+        .expect("serialize body");
+
+        let conflict = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/dequeue")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(conflict_body))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(conflict.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn settings_update_applies_patch() {
+        let fixed_now = Utc::now();
+        let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
+        provision_broadcaster(&state, 1).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Admin.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "patch": {"group_size": 4},
+            "op_id": Uuid::new_v4(),
+        }))
+        .expect("serialize body");
+
+        let response = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/update")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&payload).expect("json");
+        assert_eq!(json["result"]["applied"].as_bool(), Some(true));
+
+        let settings_json: (String,) =
+            sqlx::query_as("SELECT settings_json FROM broadcasters WHERE id = 'b-1'")
+                .fetch_one(state.storage().pool())
+                .await
+                .expect("settings json");
+        let settings: Settings = serde_json::from_str(&settings_json.0).expect("decode settings");
+        assert_eq!(settings.group_size, 4);
     }
 }

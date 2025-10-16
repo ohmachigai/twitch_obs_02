@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import { ApiError, createSseConnection, fetchState } from './api';
-import { applyPatch, createClientState, VersionMismatchError } from './state';
-import type { ClientState } from './state';
-import type { Patch } from './types';
+import {
+  applyPatch,
+  createClientState,
+  VersionMismatchError,
+  type ClientState,
+  type Patch,
+} from '@twi/shared-state';
 
 type ConnectionStatus = 'idle' | 'loading' | 'live' | 'reconnecting' | 'error';
 

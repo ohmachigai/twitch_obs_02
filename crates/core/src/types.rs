@@ -290,6 +290,9 @@ impl fmt::Display for NormalizedRedemptionStatus {
 pub enum Command {
     Enqueue(EnqueueCommand),
     RedemptionUpdate(RedemptionUpdateCommand),
+    QueueComplete(QueueCompleteCommand),
+    QueueRemove(QueueRemoveCommand),
+    SettingsUpdate(SettingsUpdateCommand),
 }
 
 impl Command {
@@ -301,6 +304,9 @@ impl Command {
                 RedemptionUpdateMode::Consume => "consume",
                 RedemptionUpdateMode::Refund => "refund",
             },
+            Self::QueueComplete(_) => "complete",
+            Self::QueueRemove(_) => "undo",
+            Self::SettingsUpdate(_) => "settings",
         }
     }
 
@@ -309,6 +315,9 @@ impl Command {
         match self {
             Self::Enqueue(command) => command.redacted(),
             Self::RedemptionUpdate(command) => command.redacted(),
+            Self::QueueComplete(command) => command.redacted(),
+            Self::QueueRemove(command) => command.redacted(),
+            Self::SettingsUpdate(command) => command.redacted(),
         }
     }
 }
@@ -384,6 +393,93 @@ impl RedemptionUpdateCommand {
 pub enum RedemptionUpdateMode {
     Refund,
     Consume,
+}
+
+/// Queue completion command emitted by the admin interface.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueueCompleteCommand {
+    pub broadcaster_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub source: CommandSource,
+    pub entry_id: String,
+    pub op_id: String,
+}
+
+impl QueueCompleteCommand {
+    fn redacted(&self) -> Value {
+        json!({
+            "type": "queue.complete",
+            "broadcaster_id": self.broadcaster_id,
+            "issued_at": self.issued_at,
+            "source": self.source,
+            "entry_id": self.entry_id,
+        })
+    }
+}
+
+/// Queue removal command emitted by the admin interface.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueueRemoveCommand {
+    pub broadcaster_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub source: CommandSource,
+    pub entry_id: String,
+    pub reason: QueueRemovalReason,
+    pub op_id: String,
+}
+
+impl QueueRemoveCommand {
+    fn redacted(&self) -> Value {
+        json!({
+            "type": "queue.remove",
+            "broadcaster_id": self.broadcaster_id,
+            "issued_at": self.issued_at,
+            "source": self.source,
+            "entry_id": self.entry_id,
+            "reason": self.reason,
+        })
+    }
+}
+
+/// Reason provided when removing a queue entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueueRemovalReason {
+    Undo,
+    ExplicitRemove,
+    StreamStartClear,
+}
+
+impl QueueRemovalReason {
+    /// Returns the canonical database representation for the reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Undo => "UNDO",
+            Self::ExplicitRemove => "EXPLICIT_REMOVE",
+            Self::StreamStartClear => "STREAM_START_CLEAR",
+        }
+    }
+}
+
+/// Settings update command emitted by the admin interface.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettingsUpdateCommand {
+    pub broadcaster_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub source: CommandSource,
+    pub patch: Value,
+    pub op_id: String,
+}
+
+impl SettingsUpdateCommand {
+    fn redacted(&self) -> Value {
+        json!({
+            "type": "settings.update",
+            "broadcaster_id": self.broadcaster_id,
+            "issued_at": self.issued_at,
+            "source": self.source,
+        })
+    }
 }
 
 /// Result of attempting to execute a command. Currently a placeholder until Helix integration lands.

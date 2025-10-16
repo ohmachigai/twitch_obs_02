@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Twitch Overlay Admin</title>
+    <link rel="stylesheet" href="/src/main.css" />
+  </head>
+  <body>
+    <div id="app" class="page">
+      <header>
+        <h1>Overlay Admin</h1>
+        <div id="connection-status" class="status status-idle">Idle</div>
+      </header>
+      <section id="alerts" role="status" aria-live="polite"></section>
+      <main class="grid">
+        <section>
+          <h2>Queue</h2>
+          <div id="queue-empty" class="muted">Queue is empty.</div>
+          <ul id="queue-list" class="queue"></ul>
+        </section>
+        <section>
+          <h2>Counters</h2>
+          <div id="counters-empty" class="muted">No activity yet.</div>
+          <table id="counters-table" class="counters" hidden>
+            <thead>
+              <tr>
+                <th>User</th>
+                <th>Count</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+        <section>
+          <h2>Settings</h2>
+          <form id="settings-form" novalidate>
+            <label>
+              Group size
+              <input type="number" name="group_size" min="1" required />
+            </label>
+            <label>
+              Overlay theme
+              <input type="text" name="overlay_theme" required />
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="clear_on_stream_start" />
+              Clear on stream start
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="clear_decrement_counts" />
+              Decrement counters when clearing
+            </label>
+            <fieldset>
+              <legend>Policy</legend>
+              <label>
+                Anti-spam window (sec)
+                <input type="number" name="policy.anti_spam_window_sec" min="0" />
+              </label>
+              <label>
+                Duplicate policy
+                <select name="policy.duplicate_policy">
+                  <option value="consume">Consume</option>
+                  <option value="refund">Refund</option>
+                </select>
+              </label>
+            </fieldset>
+            <div class="form-actions">
+              <button type="submit">Save settings</button>
+            </div>
+          </form>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

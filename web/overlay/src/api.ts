@@ -1,4 +1,4 @@
-import type { StateSnapshot } from './types';
+import type { StateSnapshot } from '@twi/shared-state';
 
 export interface ProblemDetails {
   type: string;

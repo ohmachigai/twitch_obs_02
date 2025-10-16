@@ -615,7 +615,7 @@ async fn dispatch_commands(
     }
 }
 
-fn emit_sse_stage(state: &AppState, broadcaster_id: &str, patch: &Patch) {
+pub(crate) fn emit_sse_stage(state: &AppState, broadcaster_id: &str, patch: &Patch) {
     let latency = state
         .now()
         .signed_duration_since(patch.at)

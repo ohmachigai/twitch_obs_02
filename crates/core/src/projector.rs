@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::types::{Patch, PatchKind, QueueEntry, RedemptionUpdateCommand, StateSnapshot};
+use crate::types::{
+    Patch, PatchKind, QueueEntry, QueueRemovalReason, RedemptionUpdateCommand, StateSnapshot,
+};
 
 /// Pure projector helpers that transform commands into patches.
 pub struct Projector;
@@ -53,12 +55,67 @@ impl Projector {
             data: json!({ "state": snapshot }),
         }
     }
+
+    /// Builds a `queue.completed` patch for the provided entry identifier.
+    pub fn queue_completed(version: u64, at: DateTime<Utc>, entry_id: &str) -> Patch {
+        Patch {
+            version,
+            kind: PatchKind::QueueCompleted,
+            at,
+            data: json!({ "entry_id": entry_id }),
+        }
+    }
+
+    /// Builds a `queue.removed` patch describing the removal reason and updated count.
+    pub fn queue_removed(
+        version: u64,
+        at: DateTime<Utc>,
+        entry_id: &str,
+        reason: QueueRemovalReason,
+        user_today_count: u32,
+    ) -> Patch {
+        Patch {
+            version,
+            kind: PatchKind::QueueRemoved,
+            at,
+            data: json!({
+                "entry_id": entry_id,
+                "reason": reason,
+                "user_today_count": user_today_count,
+            }),
+        }
+    }
+
+    /// Builds a `counter.updated` patch for the provided user.
+    pub fn counter_updated(version: u64, at: DateTime<Utc>, user_id: &str, count: u32) -> Patch {
+        Patch {
+            version,
+            kind: PatchKind::CounterUpdated,
+            at,
+            data: json!({
+                "user_id": user_id,
+                "count": count,
+            }),
+        }
+    }
+
+    /// Builds a `settings.updated` patch with the applied patch payload.
+    pub fn settings_updated(version: u64, at: DateTime<Utc>, patch: &serde_json::Value) -> Patch {
+        Patch {
+            version,
+            kind: PatchKind::SettingsUpdated,
+            at,
+            data: json!({ "patch": patch }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CommandResult, QueueEntryStatus, Settings, UserCounter};
+    use crate::types::{
+        CommandResult, QueueEntryStatus, QueueRemovalReason, Settings, UserCounter,
+    };
 
     fn sample_entry() -> QueueEntry {
         QueueEntry {
@@ -131,5 +188,41 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn queue_completed_embeds_entry_id() {
+        let at = Utc::now();
+        let patch = Projector::queue_completed(7, at, "entry-1");
+        assert_eq!(patch.kind_str(), "queue.completed");
+        assert_eq!(patch.data["entry_id"].as_str(), Some("entry-1"));
+    }
+
+    #[test]
+    fn queue_removed_carries_reason_and_count() {
+        let at = Utc::now();
+        let patch = Projector::queue_removed(8, at, "entry-2", QueueRemovalReason::Undo, 4);
+        assert_eq!(patch.kind_str(), "queue.removed");
+        assert_eq!(patch.data["entry_id"].as_str(), Some("entry-2"));
+        assert_eq!(patch.data["reason"].as_str(), Some("UNDO"));
+        assert_eq!(patch.data["user_today_count"].as_u64(), Some(4));
+    }
+
+    #[test]
+    fn counter_updated_embeds_user_and_count() {
+        let at = Utc::now();
+        let patch = Projector::counter_updated(9, at, "user-1", 10);
+        assert_eq!(patch.kind_str(), "counter.updated");
+        assert_eq!(patch.data["user_id"].as_str(), Some("user-1"));
+        assert_eq!(patch.data["count"].as_u64(), Some(10));
+    }
+
+    #[test]
+    fn settings_updated_wraps_patch() {
+        let at = Utc::now();
+        let patch_payload = json!({ "group_size": 3 });
+        let patch = Projector::settings_updated(11, at, &patch_payload);
+        assert_eq!(patch.kind_str(), "settings.updated");
+        assert_eq!(patch.data["patch"], patch_payload);
     }
 }
