@@ -1,0 +1,163 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #111827;
+  color: #f9fafb;
+}
+
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.5rem;
+}
+
+.queue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.queue li {
+  background: #1f2937;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.queue li header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0;
+}
+
+.queue button {
+  margin-right: 0.5rem;
+}
+
+.queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.counters {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.counters th,
+.counters td {
+  padding: 0.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.form-actions {
+  margin-top: 1rem;
+}
+
+button {
+  background: #2563eb;
+  color: #fff;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: #6b7280;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+}
+
+.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+input,
+select {
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(17, 24, 39, 0.8);
+  color: inherit;
+}
+
+.status {
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.875rem;
+}
+
+.status-idle {
+  background: rgba(107, 114, 128, 0.2);
+}
+
+.status-loading {
+  background: rgba(59, 130, 246, 0.2);
+  color: #bfdbfe;
+}
+
+.status-live {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}
+
+.status-error {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+}
+
+.muted {
+  color: #9ca3af;
+}
+
+.alert {
+  margin-bottom: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+}
+
+.alert-error {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+}
+
+.alert-success {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}

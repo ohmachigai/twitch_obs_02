@@ -2,6 +2,7 @@ import type {
   Patch,
   QueueEntry,
   Settings,
+  SettingsPatch,
   StateSnapshot,
 } from './types';
 
@@ -83,7 +84,7 @@ export function applyPatch(state: ClientState, patch: Patch): ClientState {
       };
     }
     case 'settings.updated': {
-      const settings = mergeSettings(state.settings, patch.data.settings);
+      const settings = mergeSettings(state.settings, patch.data.patch);
       return {
         version: patch.version,
         queue: state.queue,
@@ -105,15 +106,16 @@ export function applyPatch(state: ClientState, patch: Patch): ClientState {
   }
 }
 
-function mergeSettings(current: Settings, incoming: Settings): Settings {
-  return {
+function mergeSettings(current: Settings, patch: SettingsPatch): Settings {
+  const mergedPolicy = patch.policy
+    ? { ...current.policy, ...patch.policy }
+    : current.policy;
+  const base: Settings = {
     ...current,
-    ...incoming,
-    policy: {
-      ...current.policy,
-      ...incoming.policy,
-    },
+    ...patch,
+    policy: mergedPolicy,
   };
+  return base;
 }
 
 function sortQueue(entries: QueueEntry[], counters: Record<string, number>): QueueEntry[] {

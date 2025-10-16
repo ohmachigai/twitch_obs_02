@@ -56,19 +56,52 @@ jobs:
         with:
           node-version: 18
           cache: 'npm'
-          cache-dependency-path: web/overlay/package-lock.json
-      - name: Install dependencies
+          cache-dependency-path: |
+            web/shared/package-lock.json
+            web/overlay/package-lock.json
+            web/admin/package-lock.json
+      - name: Install dependencies (shared)
+        working-directory: web/shared
+        run: npm ci
+      - name: Lint (shared)
+        working-directory: web/shared
+        run: npm run lint
+      - name: Type check (shared)
+        working-directory: web/shared
+        run: npm run typecheck
+      - name: Test (shared)
+        working-directory: web/shared
+        run: npm run test
+      - name: Build (shared)
+        working-directory: web/shared
+        run: npm run build
+      - name: Install dependencies (overlay)
         working-directory: web/overlay
         run: npm ci
-      - name: Lint
+      - name: Lint (overlay)
         working-directory: web/overlay
         run: npm run lint
-      - name: Type check
+      - name: Type check (overlay)
         working-directory: web/overlay
         run: npm run typecheck
-      - name: Test
+      - name: Test (overlay)
         working-directory: web/overlay
         run: npm run test
-      - name: Build
+      - name: Build (overlay)
         working-directory: web/overlay
+        run: npm run build
+      - name: Install dependencies (admin)
+        working-directory: web/admin
+        run: npm ci
+      - name: Lint (admin)
+        working-directory: web/admin
+        run: npm run lint
+      - name: Type check (admin)
+        working-directory: web/admin
+        run: npm run typecheck
+      - name: Test (admin)
+        working-directory: web/admin
+        run: npm run test
+      - name: Build (admin)
+        working-directory: web/admin
         run: npm run build

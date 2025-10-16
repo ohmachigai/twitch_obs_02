@@ -1,19 +1,18 @@
 {
+  "extends": "./tsconfig.node.json",
   "compilerOptions": {
-    "composite": true,
+    "types": ["vite/client", "vitest/globals"],
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "resolveJsonModule": true,
     "target": "ES2020",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "composite": false,
     "baseUrl": ".",
     "paths": {
       "@twi/shared-state": ["../shared/src/index.ts"],
       "@twi/shared-state/*": ["../shared/src/*"]
     }
   },
-  "include": ["vite.config.ts"]
+  "include": ["src"]
 }
