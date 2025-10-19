@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::types::{
-    Patch, PatchKind, QueueEntry, QueueRemovalReason, RedemptionUpdateCommand, StateSnapshot,
+    Patch, PatchKind, QueueEntry, QueueRemovalReason, QueueReorderEntry, RedemptionUpdateCommand,
+    StateSnapshot,
 };
 
 /// Pure projector helpers that transform commands into patches.
@@ -67,12 +68,12 @@ impl Projector {
     }
 
     /// Builds a `queue.completed` patch for the provided entry identifier.
-    pub fn queue_completed(version: u64, at: DateTime<Utc>, entry_id: &str) -> Patch {
+    pub fn queue_completed(version: u64, at: DateTime<Utc>, entry: QueueEntry) -> Patch {
         Patch {
             version,
             kind: PatchKind::QueueCompleted,
             at,
-            data: json!({ "entry_id": entry_id }),
+            data: json!({ "entry": entry }),
         }
     }
 
@@ -93,6 +94,20 @@ impl Projector {
                 "reason": reason,
                 "user_today_count": user_today_count,
             }),
+        }
+    }
+
+    /// Builds a `queue.reordered` patch containing the updated display order values.
+    pub fn queue_reordered(
+        version: u64,
+        at: DateTime<Utc>,
+        entries: &[QueueReorderEntry],
+    ) -> Patch {
+        Patch {
+            version,
+            kind: PatchKind::QueueReordered,
+            at,
+            data: json!({ "entries": entries }),
         }
     }
 
@@ -124,7 +139,8 @@ impl Projector {
 mod tests {
     use super::*;
     use crate::types::{
-        CommandResult, QueueEntryStatus, QueueRemovalReason, Settings, UserCounter,
+        CommandResult, QueueEntryStatus, QueueRemovalReason, QueueReorderEntry, Settings,
+        UserCounter,
     };
 
     fn sample_entry() -> QueueEntry {
@@ -138,8 +154,10 @@ mod tests {
             reward_id: "r-join".to_string(),
             redemption_id: Some("red-1".to_string()),
             enqueued_at: Utc::now(),
+            display_order: 1.0,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: true,
             last_updated_at: Utc::now(),
         }
@@ -184,6 +202,7 @@ mod tests {
         let snapshot = StateSnapshot {
             version: 12,
             queue: vec![sample_entry()],
+            completed: Vec::new(),
             counters_today: vec![UserCounter {
                 user_id: "u-1".to_string(),
                 count: 2,
@@ -204,11 +223,21 @@ mod tests {
     }
 
     #[test]
-    fn queue_completed_embeds_entry_id() {
+    fn queue_completed_embeds_entry() {
         let at = Utc::now();
-        let patch = Projector::queue_completed(7, at, "entry-1");
+        let mut entry = sample_entry();
+        entry.status = QueueEntryStatus::Completed;
+        entry.completed_at = Some(at);
+        let patch = Projector::queue_completed(7, at, entry.clone());
         assert_eq!(patch.kind_str(), "queue.completed");
-        assert_eq!(patch.data["entry_id"].as_str(), Some("entry-1"));
+        assert_eq!(patch.data["entry"]["id"].as_str(), Some("entry-1"));
+        let completed_str = patch.data["entry"]["completed_at"]
+            .as_str()
+            .expect("completed_at");
+        let parsed = DateTime::parse_from_rfc3339(completed_str)
+            .expect("valid rfc3339")
+            .with_timezone(&Utc);
+        assert_eq!(parsed, at);
     }
 
     #[test]
@@ -237,5 +266,27 @@ mod tests {
         let patch = Projector::settings_updated(11, at, &patch_payload);
         assert_eq!(patch.kind_str(), "settings.updated");
         assert_eq!(patch.data["patch"], patch_payload);
+    }
+
+    #[test]
+    fn queue_reordered_contains_updates() {
+        let at = Utc::now();
+        let entries = vec![
+            QueueReorderEntry {
+                entry_id: "entry-1".to_string(),
+                display_order: 1.0,
+            },
+            QueueReorderEntry {
+                entry_id: "entry-2".to_string(),
+                display_order: 2.5,
+            },
+        ];
+        let patch = Projector::queue_reordered(12, at, &entries);
+        assert_eq!(patch.kind_str(), "queue.reordered");
+        assert_eq!(patch.data["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            patch.data["entries"][1]["display_order"].as_f64(),
+            Some(2.5)
+        );
     }
 }

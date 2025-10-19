@@ -119,9 +119,26 @@
       "user_avatar": "https://...",
       "reward_id": "r-join",
       "enqueued_at": "2025-10-12T13:00:10.000Z",
+      "display_order": 1734046810.0,
       "status": "QUEUED",
       "managed": true,
       "last_updated_at": "2025-10-12T13:00:10.000Z"
+    }
+  ],
+  "completed": [
+    {
+      "id": "01HZXX...",
+      "broadcaster_id": "b-123",
+      "user_id": "u-99",
+      "user_login": "bob",
+      "user_display_name": "Bob",
+      "reward_id": "r-join",
+      "enqueued_at": "2025-10-12T12:45:00.000Z",
+      "display_order": 1734045900.0,
+      "status": "COMPLETED",
+      "completed_at": "2025-10-12T13:05:12.000Z",
+      "managed": true,
+      "last_updated_at": "2025-10-12T13:05:12.000Z"
     }
   ],
   "counters_today": [
@@ -132,6 +149,7 @@
     "group_size": 6,
     "clear_on_stream_start": true,
     "clear_decrement_counts": false,
+    "prioritize_low_counts": true,
     "policy": {
       "anti_spam_window_sec": 60,
       "duplicate_policy": "consume",
@@ -145,7 +163,7 @@
 
   * `scope=session`：`stream.online`〜`offline` の現行セッション（オフライン時は直近セッション）。
   * `scope=since`：`since` 時刻以降の状態に必要な要素を返す。
-  * **順序**：`queue` は `today_count ASC, enqueued_at ASC`（MUST）。
+* **順序**：`queue` は設定フラグに応じて `display_order` を基準にしつつ `prioritize_low_counts=true` のときは `today_count ASC, display_order ASC`（MUST）。`completed` は `completed_at DESC, display_order ASC`。
 
 ---
 
@@ -189,7 +207,7 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
   * **types**：サーバ側で帯域削減のための coarse フィルタ（任意）。
 
 * **パッチの型（代表）**：
-  `queue.enqueued` / `queue.removed` / `queue.completed` / `counter.updated` /
+  `queue.enqueued` / `queue.removed` / `queue.completed` / `queue.reordered` / `counter.updated` /
   `settings.updated` / `redemption.updated` / `stream.online` / `stream.offline` /
   `state.replace` （詳細は `03-domain-model.md` §6）
 
@@ -221,13 +239,71 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
   * `error` 文字列は PII を含めず、`prefix:slug` 形式で分類（`twitch:unauthorized`, `network:timeout` など）。
   * Queue snapshot (`state.replace`) 内の `queue[].managed` も同値で更新される（Helix 成功で `true`）。
 
+#### `queue.completed`
+
+* **Purpose**：完了したキュー項目の全情報と完了時刻を通知し、管理 UI で履歴表示・Undo に備える。
+* **データスキーマ**：
+
+  ```json
+  {
+    "type": "queue.completed",
+    "version": 12352,
+    "at": "2025-10-12T13:05:12.000Z",
+    "data": {
+      "entry": {
+        "id": "01HZXX...",
+        "broadcaster_id": "b-123",
+        "user_id": "u-99",
+        "user_login": "bob",
+        "user_display_name": "Bob",
+        "reward_id": "r-join",
+        "enqueued_at": "2025-10-12T12:45:00.000Z",
+        "display_order": 1734045900.0,
+        "status": "COMPLETED",
+        "completed_at": "2025-10-12T13:05:12.000Z",
+        "managed": true,
+        "last_updated_at": "2025-10-12T13:05:12.000Z"
+      }
+    }
+  }
+  ```
+
+* **規範**：
+
+  * `entry.status` は `COMPLETED`。Undo 時には後続 PR で `queue.enqueued` が送られ、`display_order` を再利用して元位置へ復帰する。
+  * `completed_at` は完了操作時の UTC 時刻。`state.replace` でも同じ値を返す（非同期再接続用）。
+
+#### `queue.reordered`
+
+* **Purpose**：待機列の表示順が更新されたことをクライアントへ通知する。
+* **データスキーマ**：
+
+  ```json
+  {
+    "type": "queue.reordered",
+    "version": 12353,
+    "at": "2025-10-12T13:06:00.000Z",
+    "data": {
+      "entries": [
+        { "entry_id": "01HZX...", "display_order": 1.0 },
+        { "entry_id": "01HZY...", "display_order": 2.0 }
+      ]
+    }
+  }
+  ```
+
+* **規範**：
+
+  * `entries` は更新対象のみを含む。順序は新しい表示順を昇順で表現する。
+  * `display_order` はサーバに保存された値をそのまま送る（クライアントは受信後に並び替えを再評価する）。
+
 ---
 
 ## 4. 管理操作（Mutations）
 
 > すべて **認証必須**（broadcaster の RBAC に従う）。**`op_id`（UUID）必須**で冪等（**MUST**）。
 
-### 4.1 キュー外し（COMPLETE / UNDO）
+### 4.1 キュー外し（COMPLETE / UNDO / CANCEL）
 
 #### `POST /api/queue/dequeue`
 
@@ -242,7 +318,10 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
 }
 ```
 
-* **mode**：`"COMPLETE"`（並び終わり、**count 不変**）｜`"UNDO"`（巻き戻し、**count -1**）
+* **mode**：
+  * `"COMPLETE"` — 並び終わり。完了リストへ移動し、**count 不変**。
+  * `"UNDO"` — 完了を取り消し、元の並び順でキューへ戻す。**count 不変**。
+  * `"CANCEL"` — 完全削除。キュー/完了の双方から除去し、**count -1**。
 * **200 OK**：
 
 ```json
@@ -256,14 +335,57 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
 }
 ```
 
-* **Side effects**：SSE に `queue.completed` または `queue.removed`（UNDO）＋必要に応じ `counter.updated` が配信。
+* **Side effects**：
+  * COMPLETE：SSE に `queue.completed` を配信。
+  * UNDO：SSE に `queue.enqueued` を配信（`display_order` は維持）。
+  * CANCEL：SSE に `queue.removed` を配信し、必要に応じ `counter.updated` も送信。
 
 * **エラー**：
 
   * `404 NOT_FOUND`（entry 不在/他 broadcaster）、`409 ALREADY_EXISTS`（終端状態への重複遷移）、
     `412 PRECONDITION_FAILED`（`op_id` 重複だが内容が矛盾する）など。
 
-### 4.2 設定変更
+### 4.2 キュー並び替え
+
+#### `POST /api/queue/reorder`
+
+* **Body**：
+
+```json
+{
+  "broadcaster": "b-123",
+  "entries": [
+    { "entry_id": "01HZX...", "display_order": 1.0 },
+    { "entry_id": "01HZY...", "display_order": 2.0 }
+  ],
+  "op_id": "2c9f6d5c-1c5d-4a63-8021-8a7aa2e1bf50"
+}
+```
+
+* **制約**：
+  * `entries` は 1 件以上で、`entry_id` はすべて一意（**MUST**）。
+  * `display_order` は有限値（`Number.isFinite`）を指定（**MUST**）。
+  * 対象は `status="QUEUED"` のエントリのみ。存在しない／終端状態の ID を含むと 404/409 を返す。
+  * `entries` に含まれないキュー項目の順序は変更されない。
+  * `settings.prioritize_low_counts=true` の場合は 409 `reorder_disabled` を返し、手動並び替えは受け付けない。
+* **200 OK**：
+
+```json
+{
+  "version": 12361,
+  "result": {
+    "entries": [
+      { "entry_id": "01HZX...", "display_order": 1.0 },
+      { "entry_id": "01HZY...", "display_order": 2.0 }
+    ]
+  }
+}
+```
+
+* **Side effects**：SSE に `queue.reordered` を配信（`entries` の順序と display_order を通知）。
+* **エラー**：`409 CONFLICT`（`prioritize_low_counts` 有効時の手動並び替え）ほか、`404/409/412` 等。
+
+### 4.3 設定変更
 
 #### `POST /api/settings/update`
 
@@ -275,6 +397,7 @@ data: {"version":12347,"type":"counter.updated","at":"2025-10-12T13:00:10.124Z",
   "patch": {
     "group_size": 6,
     "clear_on_stream_start": true,
+    "prioritize_low_counts": false,
     "policy": {
       "anti_spam_window_sec": 60,
       "duplicate_policy": "consume",
@@ -480,7 +603,15 @@ curl -sS -X POST http://127.0.0.1:8080/api/queue/dequeue \
   -d '{"broadcaster":"b-123","entry_id":"01HZX...","mode":"COMPLETE","op_id":"'"$(uuidgen)"'"}' | jq .
 ```
 
-### 9.4 設定更新
+### 9.4 キュー外し（CANCEL）
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/api/queue/dequeue \
+  -H "Content-Type: application/json" \
+  -d '{"broadcaster":"b-123","entry_id":"01HZX...","mode":"CANCEL","op_id":"'"$(uuidgen)"'"}' | jq .
+```
+
+### 9.5 設定更新
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/api/settings/update \
@@ -488,7 +619,7 @@ curl -sS -X POST http://127.0.0.1:8080/api/settings/update \
   -d '{"broadcaster":"b-123","patch":{"group_size":6},"op_id":"'"$(uuidgen)"'"}' | jq .
 ```
 
-### 9.5 Tap（policy のみ）
+### 9.6 Tap（policy のみ）
 
 ```bash
 curl -N "http://127.0.0.1:8080/_debug/tap?broadcaster=b-123&s=policy"
@@ -501,7 +632,7 @@ curl -N "http://127.0.0.1:8080/_debug/tap?broadcaster=b-123&s=policy"
 * [ ] Webhook：verification=200+平文、notification=204 即 ACK、HMAC/±10 分/`Message-Id` 冪等
 * [ ] State：`/api/state` が `version` 付きで初期化可能（`scope=session|since`）
 * [ ] SSE：`id=version`、心拍（20–30s）、リング再送、`Last-Event-ID` 補償、`state.replace` フォールバック
-* [ ] Mutation：`op_id` 冪等（COMPLETE/UNDO/Settings）、SSE に差分配信
+* [ ] Mutation：`op_id` 冪等（COMPLETE/UNDO/CANCEL/Settings）、SSE に差分配信
 * [ ] Debug：Tap/Capture/Replay が動作
 * [ ] セキュリティ：SSE トークン（短寿命, aud/sub/exp）、RBAC、PII マスク
 * [ ] エラー：RFC 7807 に準拠、代表ケースに正しいコードを返す

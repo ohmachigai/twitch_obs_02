@@ -9,6 +9,7 @@ describe('shared state helpers', () => {
       makeEntry('entry-1', 'user-1', '2024-01-01T10:00:00Z'),
       makeEntry('entry-2', 'user-2', '2024-01-01T10:05:00Z'),
     ],
+    completed: [],
     counters_today: [
       { user_id: 'user-1', count: 1 },
       { user_id: 'user-2', count: 1 },
@@ -52,16 +53,121 @@ describe('shared state helpers', () => {
     expect(next.queue).toHaveLength(3);
   });
 
+  it('honours manual display order when prioritization is disabled', () => {
+    const snapshot: StateSnapshot = {
+      ...baseSnapshot,
+      queue: [
+        { ...makeEntry('entry-a', 'user-a', '2024-01-01T09:05:00Z'), display_order: 2 },
+        { ...makeEntry('entry-b', 'user-b', '2024-01-01T09:00:00Z'), display_order: 1 },
+      ],
+      counters_today: [
+        { user_id: 'user-a', count: 5 },
+        { user_id: 'user-b', count: 0 },
+      ],
+      settings: { ...defaultSettings(), prioritize_low_counts: false },
+    };
+
+    const state = createClientState(snapshot);
+    expect(state.queue.map((entry) => entry.id)).toEqual(['entry-b', 'entry-a']);
+  });
+
   it('removes entries on queue.removed', () => {
     const state = createClientState(baseSnapshot);
     const patch: Patch = {
       type: 'queue.removed',
       version: 11,
       at: '2024-01-01T10:10:00Z',
-      data: { entry_id: 'entry-1', reason: 'UNDO', user_today_count: 0 },
+      data: { entry_id: 'entry-1', reason: 'EXPLICIT_REMOVE', user_today_count: 0 },
     };
     const next = applyPatch(state, patch);
     expect(next.queue.map((entry) => entry.id)).toEqual(['entry-2']);
+    expect(next.completed).toHaveLength(0);
+    expect(next.counters['user-1']).toBe(0);
+  });
+
+  it('moves entries to completed on queue.completed', () => {
+    const state = createClientState(baseSnapshot);
+    const entry = makeEntry('entry-1', 'user-1', '2024-01-01T10:00:00Z');
+    const patch: Patch = {
+      type: 'queue.completed',
+      version: 11,
+      at: '2024-01-01T10:10:00Z',
+      data: {
+        entry: { ...entry, status: 'COMPLETED', completed_at: '2024-01-01T10:10:00Z' },
+      },
+    };
+    const next = applyPatch(state, patch);
+    expect(next.queue.map((item) => item.id)).toEqual(['entry-2']);
+    expect(next.completed[0].id).toBe('entry-1');
+    expect(next.completed[0].completed_at).toBe('2024-01-01T10:10:00Z');
+  });
+
+  it('restores completed entries on queue.enqueued after undo', () => {
+    const entry = makeEntry('entry-1', 'user-1', '2024-01-01T10:00:00Z');
+    const completed: Patch = {
+      type: 'queue.completed',
+      version: 11,
+      at: '2024-01-01T10:10:00Z',
+      data: {
+        entry: { ...entry, status: 'COMPLETED', completed_at: '2024-01-01T10:10:00Z' },
+      },
+    };
+    const afterComplete = applyPatch(createClientState(baseSnapshot), completed);
+    const undo: Patch = {
+      type: 'queue.enqueued',
+      version: 12,
+      at: '2024-01-01T10:12:00Z',
+      data: {
+        entry,
+        user_today_count: 1,
+      },
+    };
+    const restored = applyPatch(afterComplete, undo);
+    expect(restored.queue.map((item) => item.id)).toEqual(['entry-1', 'entry-2']);
+    expect(restored.completed).toHaveLength(0);
+    expect(restored.counters['user-1']).toBe(1);
+  });
+
+  it('removes completed entries on queue.removed', () => {
+    const entry = makeEntry('entry-1', 'user-1', '2024-01-01T10:00:00Z');
+    const completedState = applyPatch(
+      createClientState(baseSnapshot),
+      {
+        type: 'queue.completed',
+        version: 11,
+        at: '2024-01-01T10:10:00Z',
+        data: {
+          entry: { ...entry, status: 'COMPLETED', completed_at: '2024-01-01T10:10:00Z' },
+        },
+      }
+    );
+    const removed = applyPatch(completedState, {
+      type: 'queue.removed',
+      version: 12,
+      at: '2024-01-01T10:12:00Z',
+      data: { entry_id: 'entry-1', reason: 'EXPLICIT_REMOVE', user_today_count: 0 },
+    });
+    expect(removed.queue.map((item) => item.id)).toEqual(['entry-2']);
+    expect(removed.completed).toHaveLength(0);
+    expect(removed.counters['user-1']).toBe(0);
+  });
+
+  it('updates display order on queue.reordered', () => {
+    const state = createClientState(baseSnapshot);
+    const patch: Patch = {
+      type: 'queue.reordered',
+      version: 11,
+      at: '2024-01-01T10:12:00Z',
+      data: {
+        entries: [
+          { entry_id: 'entry-1', display_order: 5 },
+          { entry_id: 'entry-2', display_order: 1 },
+        ],
+      },
+    };
+    const next = applyPatch(state, patch);
+    expect(next.version).toBe(11);
+    expect(next.queue.map((item) => item.id)).toEqual(['entry-2', 'entry-1']);
   });
 
   it('throws on version mismatch', () => {
@@ -81,6 +187,7 @@ describe('shared state helpers', () => {
     const snapshot: StateSnapshot = {
       version: 25,
       queue: [makeEntry('entry-9', 'user-9', '2024-01-01T11:00:00Z')],
+      completed: [],
       counters_today: [{ user_id: 'user-9', count: 1 }],
       settings: defaultSettings(),
     };
@@ -119,6 +226,39 @@ describe('shared state helpers', () => {
     expect(next.settings.policy.target_rewards).toEqual([]);
   });
 
+  it('resorts queue when prioritize_low_counts changes', () => {
+    const snapshot: StateSnapshot = {
+      ...baseSnapshot,
+      queue: [
+        { ...makeEntry('entry-a', 'user-a', '2024-01-01T09:05:00Z'), display_order: 2 },
+        { ...makeEntry('entry-b', 'user-b', '2024-01-01T09:00:00Z'), display_order: 1 },
+      ],
+      counters_today: [
+        { user_id: 'user-a', count: 0 },
+        { user_id: 'user-b', count: 5 },
+      ],
+      settings: defaultSettings(),
+    };
+    const state = createClientState(snapshot);
+    const disable: Patch = {
+      type: 'settings.updated',
+      version: state.version + 1,
+      at: '2024-01-01T10:30:00Z',
+      data: { patch: { prioritize_low_counts: false } },
+    };
+    const disabled = applyPatch(state, disable);
+    expect(disabled.queue.map((entry) => entry.id)).toEqual(['entry-b', 'entry-a']);
+
+    const enable: Patch = {
+      type: 'settings.updated',
+      version: disabled.version + 1,
+      at: '2024-01-01T10:35:00Z',
+      data: { patch: { prioritize_low_counts: true } },
+    };
+    const enabled = applyPatch(disabled, enable);
+    expect(enabled.queue.map((entry) => entry.id)).toEqual(['entry-a', 'entry-b']);
+  });
+
   it('updates queue managed flag on redemption.updated', () => {
     const state = createClientState(baseSnapshot);
     const patch: Patch = {
@@ -150,6 +290,7 @@ function makeEntry(id: string, userId: string, enqueuedAt: string): QueueEntry {
     reward_id: 'reward-1',
     redemption_id: `${id}-redemption`,
     enqueued_at: enqueuedAt,
+    display_order: Date.parse(enqueuedAt) / 1000,
     status: 'QUEUED',
     managed: false,
     last_updated_at: enqueuedAt,
@@ -162,6 +303,7 @@ function defaultSettings() {
     group_size: 1,
     clear_on_stream_start: false,
     clear_decrement_counts: false,
+    prioritize_low_counts: true,
     policy: {
       anti_spam_window_sec: 60,
       duplicate_policy: 'consume' as const,

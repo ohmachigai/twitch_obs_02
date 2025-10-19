@@ -1,4 +1,4 @@
-import type { StateSnapshot, SettingsPatch } from '@twi/shared-state';
+import type { QueueReorderUpdate, StateSnapshot, SettingsPatch } from '@twi/shared-state';
 
 export class ApiError extends Error {
   constructor(public status: number, message: string, public problem?: ProblemDetails) {
@@ -38,7 +38,7 @@ export async function fetchState(options: FetchStateOptions): Promise<StateSnaps
   return (await response.json()) as StateSnapshot;
 }
 
-export type QueueMutationMode = 'COMPLETE' | 'UNDO';
+export type QueueMutationMode = 'COMPLETE' | 'UNDO' | 'CANCEL';
 
 export interface QueueDequeueOptions {
   baseUrl: string;
@@ -109,10 +109,44 @@ export interface QueueDequeueResponse {
   };
 }
 
+export interface QueueReorderOptions {
+  baseUrl: string;
+  broadcaster: string;
+  token: string;
+  entries: QueueReorderUpdate[];
+  opId: string;
+}
+
+export async function queueReorder(options: QueueReorderOptions) {
+  const { baseUrl, broadcaster, token, entries, opId } = options;
+  const response = await fetch(new URL('/api/queue/reorder', baseUrl).toString(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ broadcaster, entries, op_id: opId }),
+  });
+
+  if (!response.ok) {
+    const problem = await parseProblem(response);
+    throw new ApiError(response.status, problem?.detail ?? 'failed to reorder queue', problem);
+  }
+
+  return (await response.json()) as QueueReorderResponse;
+}
+
 export interface SettingsUpdateResponse {
   version: number;
   result: {
     applied: boolean;
+  };
+}
+
+export interface QueueReorderResponse {
+  version: number;
+  result: {
+    entries: QueueReorderUpdate[];
   };
 }
 

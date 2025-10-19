@@ -1193,6 +1193,7 @@ mod tests {
             "group_size": 1,
             "clear_on_stream_start": false,
             "clear_decrement_counts": false,
+            "prioritize_low_counts": true,
             "policy": {
                 "anti_spam_window_sec": 60,
                 "duplicate_policy": "consume",

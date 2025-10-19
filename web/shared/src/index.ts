@@ -5,6 +5,8 @@ export { applyPatch, createClientState, VersionMismatchError } from './state';
 export type {
   CounterUpdatedPatch,
   Patch,
+  QueueReorderUpdate,
+  QueueReorderedPatch,
   QueueCompletedPatch,
   QueueEnqueuedPatch,
   QueueEntry,

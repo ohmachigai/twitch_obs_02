@@ -17,7 +17,7 @@ use tracing::{error, info};
 use twi_overlay_core::policy::PolicyEngine;
 use twi_overlay_core::types::{
     Command, CommandSource, Patch, QueueCompleteCommand, QueueRemovalReason, QueueRemoveCommand,
-    SettingsUpdateCommand,
+    QueueReorderCommand, QueueReorderEntry, SettingsUpdateCommand,
 };
 use twi_overlay_storage::{Database, QueueError, SettingsError};
 use twi_overlay_twitch::{HelixClient, TwitchOAuthClient};
@@ -215,6 +215,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/admin/sse", get(admin_sse))
         .route("/api/state", get(state_snapshot))
         .route("/api/queue/dequeue", post(queue_dequeue))
+        .route("/api/queue/reorder", post(queue_reorder))
         .route("/api/settings/update", post(settings_update))
         .route("/eventsub/webhook", post(webhook::handle))
         .route("/oauth/login", get(oauth::login))
@@ -277,6 +278,7 @@ struct QueueDequeueRequest {
 enum QueueDequeueMode {
     Complete,
     Undo,
+    Cancel,
 }
 
 impl QueueDequeueMode {
@@ -284,6 +286,7 @@ impl QueueDequeueMode {
         match self {
             QueueDequeueMode::Complete => "COMPLETE",
             QueueDequeueMode::Undo => "UNDO",
+            QueueDequeueMode::Cancel => "CANCEL",
         }
     }
 }
@@ -299,6 +302,36 @@ struct QueueDequeueResultBody {
 struct QueueDequeueResponse {
     version: u64,
     result: QueueDequeueResultBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueReorderRequest {
+    broadcaster: String,
+    entries: Vec<QueueReorderRequestEntry>,
+    op_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueReorderRequestEntry {
+    entry_id: String,
+    display_order: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueReorderResultEntry {
+    entry_id: String,
+    display_order: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueReorderResultBody {
+    entries: Vec<QueueReorderResultEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueReorderResponse {
+    version: u64,
+    result: QueueReorderResultBody,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,6 +604,14 @@ async fn queue_dequeue(
             reason: QueueRemovalReason::Undo,
             op_id: payload.op_id.clone(),
         }),
+        QueueDequeueMode::Cancel => Command::QueueRemove(QueueRemoveCommand {
+            broadcaster_id: payload.broadcaster.clone(),
+            issued_at: now,
+            source: CommandSource::Admin,
+            entry_id: payload.entry_id.clone(),
+            reason: QueueRemovalReason::ExplicitRemove,
+            op_id: payload.op_id.clone(),
+        }),
     };
 
     let application = match state
@@ -632,6 +673,207 @@ async fn queue_dequeue(
             entry_id,
             mode: mode.as_str().to_string(),
             user_today_count,
+        },
+    }))
+}
+
+async fn queue_reorder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<QueueReorderRequest>,
+) -> Result<Json<QueueReorderResponse>, ProblemResponse> {
+    let token = extract_bearer_token(&headers).ok_or_else(|| {
+        counter!("api_queue_reorder_requests_total", "result" => "unauthorized").increment(1);
+        ProblemResponse::new(
+            StatusCode::UNAUTHORIZED,
+            "missing_token",
+            "queue reorder endpoint requires a bearer token",
+        )
+    })?;
+
+    if Uuid::parse_str(&payload.op_id).is_err() {
+        counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+        return Err(ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_op_id",
+            "op_id must be a valid UUID",
+        ));
+    }
+
+    if payload.entries.is_empty() {
+        counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+        return Err(ProblemResponse::new(
+            StatusCode::BAD_REQUEST,
+            "entries_required",
+            "at least one entry must be provided",
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(payload.entries.len());
+    for entry in &payload.entries {
+        if entry.entry_id.trim().is_empty() {
+            counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+            return Err(ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_entry_id",
+                "entry_id must be a non-empty string",
+            ));
+        }
+        if !entry.display_order.is_finite() {
+            counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+            return Err(ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_display_order",
+                "display_order must be a finite number",
+            ));
+        }
+        if !seen.insert(entry.entry_id.clone()) {
+            counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+            return Err(ProblemResponse::new(
+                StatusCode::BAD_REQUEST,
+                "duplicate_entry_id",
+                "entries must not contain duplicates",
+            ));
+        }
+    }
+
+    let now = state.now();
+    if let Err(err) =
+        state
+            .token_validator()
+            .validate(token, Audience::Admin, &payload.broadcaster, now)
+    {
+        counter!("api_queue_reorder_requests_total", "result" => "unauthorized").increment(1);
+        return Err(problem_for_token_error(err));
+    }
+
+    let profile = match state
+        .storage()
+        .broadcasters()
+        .fetch_settings(&payload.broadcaster)
+        .await
+    {
+        Ok(profile) => profile,
+        Err(SettingsError::NotFound) => {
+            counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+            return Err(ProblemResponse::new(
+                StatusCode::NOT_FOUND,
+                "broadcaster_not_found",
+                "broadcaster is not provisioned",
+            ));
+        }
+        Err(err) => {
+            counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+            error!(
+                stage = "mutation",
+                broadcaster = %payload.broadcaster,
+                error = %err,
+                "failed to load broadcaster settings",
+            );
+            return Err(ProblemResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_error",
+                "failed to load broadcaster settings",
+            ));
+        }
+    };
+
+    if profile.settings.prioritize_low_counts {
+        counter!("api_queue_reorder_requests_total", "result" => "conflict").increment(1);
+        return Err(ProblemResponse::new(
+            StatusCode::CONFLICT,
+            "reorder_disabled",
+            "manual reorder is disabled while prioritizing low participation counts",
+        ));
+    }
+
+    let command = Command::QueueReorder(QueueReorderCommand {
+        broadcaster_id: payload.broadcaster.clone(),
+        issued_at: now,
+        source: CommandSource::Admin,
+        entries: payload
+            .entries
+            .iter()
+            .map(|entry| QueueReorderEntry {
+                entry_id: entry.entry_id.clone(),
+                display_order: entry.display_order,
+            })
+            .collect(),
+        op_id: payload.op_id.clone(),
+    });
+
+    let application = match state
+        .command_executor()
+        .execute_admin_command(&payload.broadcaster, &profile.timezone, command)
+        .await
+    {
+        Ok(application) => application,
+        Err(err) => {
+            let (problem, label) = queue_reorder_error_response(&payload, err);
+            counter!("api_queue_reorder_requests_total", "result" => label).increment(1);
+            return Err(problem);
+        }
+    };
+
+    broadcast_patches(&state, &payload.broadcaster, &application.patches).await;
+
+    if !matches!(application.result, CommandApplyResult::None) {
+        counter!("api_queue_reorder_requests_total", "result" => "error").increment(1);
+        error!(
+            stage = "mutation",
+            broadcaster = %payload.broadcaster,
+            op_id = %payload.op_id,
+            result = ?application.result,
+            "unexpected command result for queue reorder",
+        );
+        return Err(ProblemResponse::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected_result",
+            "executor returned unexpected result",
+        ));
+    }
+
+    let entries: Vec<QueueReorderEntry> = application
+        .patches
+        .iter()
+        .find(|patch| patch.kind_str() == "queue.reordered")
+        .and_then(|patch| patch.data.get("entries").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(|| {
+            payload
+                .entries
+                .iter()
+                .map(|entry| QueueReorderEntry {
+                    entry_id: entry.entry_id.clone(),
+                    display_order: entry.display_order,
+                })
+                .collect()
+        });
+
+    let response_entries = entries
+        .iter()
+        .map(|entry| QueueReorderResultEntry {
+            entry_id: entry.entry_id.clone(),
+            display_order: entry.display_order,
+        })
+        .collect::<Vec<_>>();
+
+    counter!("api_queue_reorder_requests_total", "result" => "ok").increment(1);
+    info!(
+        stage = "mutation",
+        kind = "queue.reorder",
+        broadcaster = %payload.broadcaster,
+        entries = response_entries.len(),
+        op_id = %payload.op_id,
+        duplicate = application.duplicate,
+        version = application.version,
+        "queue reordered via admin mutation",
+    );
+
+    Ok(Json(QueueReorderResponse {
+        version: application.version,
+        result: QueueReorderResultBody {
+            entries: response_entries,
         },
     }))
 }
@@ -968,6 +1210,111 @@ fn queue_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "command_error",
                     "failed to execute queue dequeue",
+                ),
+                "error",
+            )
+        }
+    }
+}
+
+fn queue_reorder_error_response(
+    request: &QueueReorderRequest,
+    err: CommandExecutorError,
+) -> (ProblemResponse, &'static str) {
+    match err {
+        CommandExecutorError::Queue(QueueError::NotFound) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entries = request.entries.len(),
+                "queue entry not found for reorder",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::NOT_FOUND,
+                    "queue_entry_not_found",
+                    "one or more queue entries were not found",
+                ),
+                "not_found",
+            )
+        }
+        CommandExecutorError::Queue(QueueError::InvalidTransition(status)) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entries = request.entries.len(),
+                status = ?status,
+                "queue entry not queued for reorder",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::CONFLICT,
+                    "invalid_transition",
+                    format!("queue entry is not queued (current={status:?})"),
+                ),
+                "conflict",
+            )
+        }
+        CommandExecutorError::OpConflict { op_id } => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                op_id = %op_id,
+                "op_id conflict for queue reorder",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::PRECONDITION_FAILED,
+                    "op_conflict",
+                    "op_id already used with different payload",
+                ),
+                "conflict",
+            )
+        }
+        CommandExecutorError::InvalidTimezone(detail) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                detail = %detail,
+                "invalid timezone while processing queue reorder",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid_timezone",
+                    detail,
+                ),
+                "error",
+            )
+        }
+        CommandExecutorError::Settings(SettingsError::NotFound) => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                "broadcaster missing during queue reorder",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::NOT_FOUND,
+                    "broadcaster_not_found",
+                    "broadcaster is not provisioned",
+                ),
+                "error",
+            )
+        }
+        other => {
+            error!(
+                stage = "mutation",
+                broadcaster = %request.broadcaster,
+                entries = request.entries.len(),
+                error = %other,
+                "failed to execute queue reorder",
+            );
+            (
+                ProblemResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "command_error",
+                    "failed to execute queue reorder",
                 ),
                 "error",
             )
@@ -1585,7 +1932,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_dequeue_undo_decrements_counter() {
+    async fn queue_dequeue_undo_restores_entry() {
+        let fixed_now = Utc::now();
+        let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
+        provision_broadcaster(&state, 1).await;
+        insert_queue_entry(&state, "entry-1", "user-1", fixed_now, fixed_now).await;
+        insert_counter(&state, "user-1", 3, fixed_now).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Admin.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+
+        let complete_op = Uuid::new_v4();
+        let complete_body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "entry_id": "entry-1",
+            "mode": "COMPLETE",
+            "op_id": complete_op,
+        }))
+        .expect("serialize body");
+
+        let complete_response = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/dequeue")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(complete_body))
+                    .unwrap(),
+            )
+            .await
+            .expect("complete response");
+        assert_eq!(complete_response.status(), StatusCode::OK);
+
+        let undo_op = Uuid::new_v4();
+        let undo_body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "entry_id": "entry-1",
+            "mode": "UNDO",
+            "op_id": undo_op,
+        }))
+        .expect("serialize body");
+
+        let undo = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/dequeue")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(undo_body))
+                    .unwrap(),
+            )
+            .await
+            .expect("undo response");
+
+        assert_eq!(undo.status(), StatusCode::OK);
+        let bytes = undo.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["result"]["mode"].as_str(), Some("UNDO"));
+        assert_eq!(json["result"]["user_today_count"].as_u64(), Some(3));
+
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, status_reason, completed_at FROM queue_entries WHERE id = 'entry-1'",
+        )
+        .fetch_one(state.storage().pool())
+        .await
+        .expect("entry status");
+        assert_eq!(row.0, QueueEntryStatus::Queued.as_str());
+        assert!(row.1.is_none());
+        assert!(row.2.is_none());
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT count FROM daily_counters WHERE user_id = 'user-1'")
+                .fetch_one(state.storage().pool())
+                .await
+                .expect("counter");
+        assert_eq!(count.0, 3);
+
+        let duplicate = app_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/dequeue")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "broadcaster": "b-1",
+                            "entry_id": "entry-1",
+                            "mode": "UNDO",
+                            "op_id": undo_op,
+                        }))
+                        .expect("serialize body"),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("duplicate undo");
+        assert_eq!(duplicate.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn queue_dequeue_cancel_decrements_counter() {
         let fixed_now = Utc::now();
         let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
         provision_broadcaster(&state, 1).await;
@@ -1602,7 +2055,7 @@ mod tests {
         let body = serde_json::to_string(&json!({
             "broadcaster": "b-1",
             "entry_id": "entry-1",
-            "mode": "UNDO",
+            "mode": "CANCEL",
             "op_id": op_id,
         }))
         .expect("serialize body");
@@ -1623,7 +2076,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(json["result"]["mode"].as_str(), Some("UNDO"));
+        assert_eq!(json["result"]["mode"].as_str(), Some("CANCEL"));
         assert_eq!(json["result"]["user_today_count"].as_u64(), Some(2));
 
         let row: (String, Option<String>) =
@@ -1632,7 +2085,10 @@ mod tests {
                 .await
                 .expect("entry status");
         assert_eq!(row.0, QueueEntryStatus::Removed.as_str());
-        assert_eq!(row.1.as_deref(), Some(QueueRemovalReason::Undo.as_str()));
+        assert_eq!(
+            row.1.as_deref(),
+            Some(QueueRemovalReason::ExplicitRemove.as_str())
+        );
 
         let count: (i64,) =
             sqlx::query_as("SELECT count FROM daily_counters WHERE user_id = 'user-1'")
@@ -1640,28 +2096,119 @@ mod tests {
                 .await
                 .expect("counter");
         assert_eq!(count.0, 2);
+    }
 
-        let conflict_body = serde_json::to_string(&json!({
+    #[tokio::test]
+    async fn queue_reorder_updates_display_order() {
+        let fixed_now = Utc::now();
+        let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
+        provision_broadcaster(&state, 1).await;
+        insert_queue_entry(&state, "entry-1", "user-1", fixed_now, fixed_now).await;
+        insert_queue_entry(&state, "entry-2", "user-2", fixed_now, fixed_now).await;
+
+        let profile = state
+            .storage()
+            .broadcasters()
+            .fetch_settings("b-1")
+            .await
+            .expect("fetch settings");
+        let mut settings = profile.settings;
+        settings.prioritize_low_counts = false;
+        let command_repo = state.storage().command_log();
+        let mut tx = command_repo.begin().await.expect("begin settings update");
+        state
+            .storage()
+            .broadcasters()
+            .update_settings(&mut tx, "b-1", &settings, fixed_now)
+            .await
+            .expect("update prioritize flag");
+        tx.commit().await.expect("commit settings update");
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Admin.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let op_id = Uuid::new_v4();
+        let body = serde_json::to_string(&json!({
             "broadcaster": "b-1",
-            "entry_id": "entry-1",
-            "mode": "COMPLETE",
-            "op_id": op_id,
+            "entries": [
+                { "entry_id": "entry-1", "display_order": 2.0 },
+                { "entry_id": "entry-2", "display_order": 1.0 }
+            ],
+            "op_id": op_id
         }))
-        .expect("serialize body");
+        .expect("serialize reorder body");
 
-        let conflict = app_router(state.clone())
+        let response = app_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/queue/dequeue")
+                    .uri("/api/queue/reorder")
                     .header(axum::http::header::AUTHORIZATION, bearer(&token))
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(conflict_body))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
-            .expect("response");
-        assert_eq!(conflict.status(), StatusCode::PRECONDITION_FAILED);
+            .expect("reorder response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            json["result"]["entries"].as_array().map(|arr| arr.len()),
+            Some(2)
+        );
+
+        let orders: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT id, display_order FROM queue_entries WHERE id IN ('entry-1','entry-2') ORDER BY id",
+        )
+        .fetch_all(state.storage().pool())
+        .await
+        .expect("fetch display order");
+        assert_eq!(orders[0].1, 2.0);
+        assert_eq!(orders[1].1, 1.0);
+    }
+
+    #[tokio::test]
+    async fn queue_reorder_rejects_duplicate_entries() {
+        let fixed_now = Utc::now();
+        let state = setup_state().await.with_clock(Arc::new(move || fixed_now));
+        provision_broadcaster(&state, 1).await;
+        insert_queue_entry(&state, "entry-1", "user-1", fixed_now, fixed_now).await;
+
+        let token = issue_token(
+            b"token-secret",
+            "b-1",
+            Audience::Admin.as_str(),
+            fixed_now + ChronoDuration::minutes(10),
+        );
+        let body = serde_json::to_string(&json!({
+            "broadcaster": "b-1",
+            "entries": [
+                { "entry_id": "entry-1", "display_order": 1.0 },
+                { "entry_id": "entry-1", "display_order": 2.0 }
+            ],
+            "op_id": Uuid::new_v4()
+        }))
+        .expect("serialize reorder body");
+
+        let response = app_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/queue/reorder")
+                    .header(axum::http::header::AUTHORIZATION, bearer(&token))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("reorder response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

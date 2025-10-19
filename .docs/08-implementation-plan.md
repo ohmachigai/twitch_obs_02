@@ -272,13 +272,13 @@ curl -N "http://127.0.0.1:8080/overlay/sse?broadcaster=b-dev&since_version=0&tok
 
 ---
 
-### **PR-6：Admin Mutations（COMPLETE / UNDO / Settings） + 管理 UI 最小**
+### **PR-6：Admin Mutations（COMPLETE / UNDO / CANCEL / Settings） + 管理 UI 最小**
 
 **目的**：手動操作の冪等・差分伝搬を完成。
 
 **変更点**
 
-* `POST /api/queue/dequeue {entry_id, mode:"COMPLETE"|"UNDO", op_id}`
+* `POST /api/queue/dequeue {entry_id, mode:"COMPLETE"|"UNDO"|"CANCEL", op_id}`
 * `POST /api/settings/update {patch, op_id}`
 * `web/admin`（htmx ベースの軽量フォーム + SSE ビュー）
 * `op_id` 冪等（`command_log(broadcaster, op_id)` partial UNIQUE）
@@ -286,7 +286,8 @@ curl -N "http://127.0.0.1:8080/overlay/sse?broadcaster=b-dev&since_version=0&tok
 **テスト**
 
 * COMPLETE：`queue.completed`、counter 不変
-* UNDO：`queue.removed(reason=UNDO)` + `counter--`
+* UNDO：`queue.enqueued`
+* CANCEL：`queue.removed(reason=EXPLICIT_REMOVE)` + `counter--`
 * `op_id` 冪等：同内容=200、矛盾=412
 
 **手動検証**
@@ -423,6 +424,13 @@ curl -sS "http://127.0.0.1:8080/api/state?broadcaster=b-dev&scope=session" | jq 
 curl -sS -X POST http://127.0.0.1:8080/api/queue/dequeue \
   -H "Content-Type: application/json" \
   -d '{"broadcaster":"b-dev","entry_id":"01HZX...","mode":"UNDO","op_id":"'"$(uuidgen)"'"}'
+
+**キュー外し（CANCEL）**
+
+```bash
+curl -sS -X POST /api/queue/dequeue \
+  -H "Content-Type: application/json" \
+  -d '{"broadcaster":"b-dev","entry_id":"01HZX...","mode":"CANCEL","op_id":"'"$(uuidgen)"'"}'
 ```
 
 **Tap（policy のみ）**
@@ -444,7 +452,7 @@ curl -N "http://127.0.0.1:8080/_debug/tap?s=policy&broadcaster=b-dev"
 **Phase 2**
 
 * [ ] Tap/Capture/Replay が動作
-* [ ] 管理 UI 最小機能（COMPLETE/UNDO/Settings）
+* [ ] 管理 UI 最小機能（COMPLETE/UNDO/CANCEL/Settings）
 * [ ] 自動再購読ユーティリティ（購読作成は別 PR で可）
 
 **Phase 3**

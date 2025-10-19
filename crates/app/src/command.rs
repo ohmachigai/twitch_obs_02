@@ -11,8 +11,8 @@ use uuid::Uuid;
 use twi_overlay_core::projector::Projector;
 use twi_overlay_core::types::{
     Command, CommandResult, EnqueueCommand, Patch, QueueCompleteCommand, QueueEntry,
-    QueueEntryStatus, QueueRemovalReason, QueueRemoveCommand, RedemptionUpdateCommand,
-    RedemptionUpdateMode, Settings, SettingsUpdateCommand,
+    QueueEntryStatus, QueueRemovalReason, QueueRemoveCommand, QueueReorderCommand,
+    RedemptionUpdateCommand, RedemptionUpdateMode, Settings, SettingsUpdateCommand,
 };
 use twi_overlay_storage::{
     BroadcasterRepository, CommandLogError, DailyCounterError, DailyCounterRepository, Database,
@@ -67,6 +67,7 @@ pub enum CommandApplyResult {
 pub enum QueueMutationMode {
     Complete,
     Undo,
+    Cancel,
 }
 
 impl QueueMutationMode {
@@ -74,6 +75,7 @@ impl QueueMutationMode {
         match self {
             QueueMutationMode::Complete => "COMPLETE",
             QueueMutationMode::Undo => "UNDO",
+            QueueMutationMode::Cancel => "CANCEL",
         }
     }
 }
@@ -155,6 +157,10 @@ impl CommandExecutor {
                 )
                 .await
             }
+            Command::QueueReorder(reorder) => {
+                self.handle_queue_reorder(tx, broadcaster_id, reorder, queue_repo)
+                    .await
+            }
             Command::SettingsUpdate(update) => {
                 self.handle_settings_update(tx, broadcaster_id, update, broadcaster_repo)
                     .await
@@ -207,7 +213,10 @@ impl CommandExecutor {
         command: Command,
     ) -> Result<CommandApplication, CommandExecutorError> {
         match command {
-            Command::QueueComplete(_) | Command::QueueRemove(_) | Command::SettingsUpdate(_) => {}
+            Command::QueueComplete(_)
+            | Command::QueueRemove(_)
+            | Command::QueueReorder(_)
+            | Command::SettingsUpdate(_) => {}
             _ => {
                 return Err(CommandExecutorError::UnsupportedCommand(
                     command.metric_kind(),
@@ -273,8 +282,10 @@ impl CommandExecutor {
             reward_id: &command.reward.id,
             redemption_id: Some(command.redemption_id.clone()),
             enqueued_at: entry.enqueued_at,
+            display_order: entry.display_order,
             status: entry.status,
             status_reason: entry.status_reason.clone(),
+            completed_at: entry.completed_at,
             managed: entry.managed,
             last_updated_at: entry.last_updated_at,
         };
@@ -587,7 +598,7 @@ impl CommandExecutor {
         }
 
         let updated_at = self.now();
-        queue_repo
+        let updated_entry = queue_repo
             .mark_completed(tx, broadcaster_id, &command.entry_id, updated_at)
             .await?;
 
@@ -611,7 +622,7 @@ impl CommandExecutor {
             Some(&command.op_id),
         );
 
-        let patch = Projector::queue_completed(version, command.issued_at, &command.entry_id);
+        let patch = Projector::queue_completed(version, command.issued_at, updated_entry);
         self.emit_projector_event(
             broadcaster_id,
             version,
@@ -682,85 +693,221 @@ impl CommandExecutor {
         }
 
         let updated_at = self.now();
-        queue_repo
-            .mark_removed(
-                tx,
-                broadcaster_id,
-                &command.entry_id,
-                command.reason,
-                updated_at,
-            )
-            .await?;
+        let (version, patches, reported_count, reported_mode) = match command.reason {
+            QueueRemovalReason::Undo => {
+                if entry.status != QueueEntryStatus::Completed {
+                    return Err(QueueError::InvalidTransition(entry.status).into());
+                }
 
-        let new_count = if matches!(command.reason, QueueRemovalReason::Undo) {
-            counter_repo
-                .decrement(tx, &day, broadcaster_id, &entry.user_id, updated_at)
-                .await?
-                .unwrap_or(0)
-        } else {
-            user_today_count
+                let restored_entry = queue_repo
+                    .restore_from_completed(tx, broadcaster_id, &command.entry_id, updated_at)
+                    .await?;
+
+                let version = self
+                    .append_command(
+                        tx,
+                        broadcaster_id,
+                        Some(&command.op_id),
+                        "queue.remove",
+                        &serialized,
+                        updated_at,
+                    )
+                    .await?;
+
+                let command_enum = Command::QueueRemove(command.clone());
+                self.emit_command_event(
+                    broadcaster_id,
+                    version,
+                    "queue.remove",
+                    &command_enum,
+                    Some(&command.op_id),
+                );
+
+                let queue_patch = Projector::queue_enqueued(
+                    version,
+                    command.issued_at,
+                    restored_entry,
+                    user_today_count,
+                );
+                self.emit_projector_event(
+                    broadcaster_id,
+                    version,
+                    &queue_patch,
+                    &command_enum,
+                    Some(&command.op_id),
+                );
+                counter!("projector_patches_total", "type" => queue_patch.kind_str()).increment(1);
+
+                (
+                    version,
+                    vec![queue_patch],
+                    user_today_count,
+                    QueueMutationMode::Undo,
+                )
+            }
+            QueueRemovalReason::ExplicitRemove | QueueRemovalReason::StreamStartClear => {
+                if entry.status == QueueEntryStatus::Removed {
+                    return Err(QueueError::InvalidTransition(entry.status).into());
+                }
+
+                let removed_entry = queue_repo
+                    .mark_removed(
+                        tx,
+                        broadcaster_id,
+                        &command.entry_id,
+                        command.reason,
+                        updated_at,
+                    )
+                    .await?;
+
+                let new_count = if matches!(command.reason, QueueRemovalReason::ExplicitRemove) {
+                    counter_repo
+                        .decrement(tx, &day, broadcaster_id, &entry.user_id, updated_at)
+                        .await?
+                        .unwrap_or(0)
+                } else {
+                    user_today_count
+                };
+
+                let version = self
+                    .append_command(
+                        tx,
+                        broadcaster_id,
+                        Some(&command.op_id),
+                        "queue.remove",
+                        &serialized,
+                        updated_at,
+                    )
+                    .await?;
+
+                let command_enum = Command::QueueRemove(command.clone());
+                self.emit_command_event(
+                    broadcaster_id,
+                    version,
+                    "queue.remove",
+                    &command_enum,
+                    Some(&command.op_id),
+                );
+
+                let mut patches = Vec::new();
+                let queue_patch = Projector::queue_removed(
+                    version,
+                    command.issued_at,
+                    &command.entry_id,
+                    command.reason,
+                    new_count,
+                );
+                self.emit_projector_event(
+                    broadcaster_id,
+                    version,
+                    &queue_patch,
+                    &command_enum,
+                    Some(&command.op_id),
+                );
+                counter!("projector_patches_total", "type" => queue_patch.kind_str()).increment(1);
+                patches.push(queue_patch);
+
+                if matches!(command.reason, QueueRemovalReason::ExplicitRemove) {
+                    let counter_patch = Projector::counter_updated(
+                        version,
+                        command.issued_at,
+                        &removed_entry.user_id,
+                        new_count,
+                    );
+                    self.emit_projector_event(
+                        broadcaster_id,
+                        version,
+                        &counter_patch,
+                        &command_enum,
+                        Some(&command.op_id),
+                    );
+                    counter!("projector_patches_total", "type" => counter_patch.kind_str())
+                        .increment(1);
+                    patches.push(counter_patch);
+                }
+
+                (version, patches, new_count, QueueMutationMode::Cancel)
+            }
         };
-
-        let version = self
-            .append_command(
-                tx,
-                broadcaster_id,
-                Some(&command.op_id),
-                "queue.remove",
-                &serialized,
-                updated_at,
-            )
-            .await?;
-
-        let command_enum = Command::QueueRemove(command.clone());
-        self.emit_command_event(
-            broadcaster_id,
-            version,
-            "queue.remove",
-            &command_enum,
-            Some(&command.op_id),
-        );
-
-        let mut patches = Vec::new();
-        let queue_patch = Projector::queue_removed(
-            version,
-            command.issued_at,
-            &command.entry_id,
-            command.reason,
-            new_count,
-        );
-        self.emit_projector_event(
-            broadcaster_id,
-            version,
-            &queue_patch,
-            &command_enum,
-            Some(&command.op_id),
-        );
-        counter!("projector_patches_total", "type" => queue_patch.kind_str()).increment(1);
-        patches.push(queue_patch);
-
-        if matches!(command.reason, QueueRemovalReason::Undo) {
-            let counter_patch =
-                Projector::counter_updated(version, command.issued_at, &entry.user_id, new_count);
-            self.emit_projector_event(
-                broadcaster_id,
-                version,
-                &counter_patch,
-                &command_enum,
-                Some(&command.op_id),
-            );
-            counter!("projector_patches_total", "type" => counter_patch.kind_str()).increment(1);
-            patches.push(counter_patch);
-        }
 
         Ok(CommandApplication {
             version,
             patches,
             result: CommandApplyResult::QueueMutation {
                 entry_id: command.entry_id.clone(),
-                mode,
-                user_today_count: new_count,
+                mode: reported_mode,
+                user_today_count: reported_count,
             },
+            duplicate: false,
+        })
+    }
+
+    async fn handle_queue_reorder(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        broadcaster_id: &str,
+        command: &QueueReorderCommand,
+        queue_repo: &QueueRepository,
+    ) -> Result<CommandApplication, CommandExecutorError> {
+        let serialized = to_string(command)?;
+        let existing_version = self
+            .ensure_unique_op_id(
+                tx,
+                broadcaster_id,
+                &command.op_id,
+                "queue.reorder",
+                &serialized,
+            )
+            .await?;
+
+        if let Some(version) = existing_version {
+            return Ok(CommandApplication {
+                version,
+                patches: Vec::new(),
+                result: CommandApplyResult::None,
+                duplicate: true,
+            });
+        }
+
+        let updated_at = self.now();
+        let updates = queue_repo
+            .reorder_entries(tx, broadcaster_id, &command.entries, updated_at)
+            .await?;
+
+        let version = self
+            .append_command(
+                tx,
+                broadcaster_id,
+                Some(&command.op_id),
+                "queue.reorder",
+                &serialized,
+                updated_at,
+            )
+            .await?;
+
+        let command_enum = Command::QueueReorder(command.clone());
+        self.emit_command_event(
+            broadcaster_id,
+            version,
+            "queue.reorder",
+            &command_enum,
+            Some(&command.op_id),
+        );
+
+        let patch = Projector::queue_reordered(version, command.issued_at, &updates);
+        self.emit_projector_event(
+            broadcaster_id,
+            version,
+            &patch,
+            &command_enum,
+            Some(&command.op_id),
+        );
+        counter!("projector_patches_total", "type" => patch.kind_str()).increment(1);
+
+        Ok(CommandApplication {
+            version,
+            patches: vec![patch],
+            result: CommandApplyResult::None,
             duplicate: false,
         })
     }
@@ -999,6 +1146,7 @@ impl CommandExecutor {
             .clone()
             .or(command.user.login.clone())
             .unwrap_or_else(|| command.user.id.clone());
+        let display_order = command.issued_at.timestamp_micros() as f64 / 1_000_000.0;
 
         QueueEntry {
             id: Uuid::new_v4().to_string(),
@@ -1010,8 +1158,10 @@ impl CommandExecutor {
             reward_id: command.reward.id.clone(),
             redemption_id: Some(command.redemption_id.clone()),
             enqueued_at: issued_at,
+            display_order,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: command.managed.unwrap_or(false),
             last_updated_at: issued_at,
         }
@@ -1022,7 +1172,7 @@ fn queue_mode_from_reason(reason: QueueRemovalReason) -> QueueMutationMode {
     match reason {
         QueueRemovalReason::Undo => QueueMutationMode::Undo,
         QueueRemovalReason::ExplicitRemove | QueueRemovalReason::StreamStartClear => {
-            QueueMutationMode::Undo
+            QueueMutationMode::Cancel
         }
     }
 }
@@ -1561,6 +1711,14 @@ mod tests {
         assert!(!result.duplicate);
         assert_eq!(result.patches.len(), 1);
         assert_eq!(result.patches[0].kind_str(), "queue.completed");
+        assert_eq!(
+            result.patches[0].data["entry"]["id"].as_str(),
+            Some(entry_id.as_str())
+        );
+        assert_eq!(
+            result.patches[0].data["entry"]["status"].as_str(),
+            Some("COMPLETED")
+        );
 
         match result.result {
             CommandApplyResult::QueueMutation {
@@ -1583,7 +1741,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_remove_undo_decrements_counter() {
+    async fn queue_remove_undo_restores_entry() {
+        let executor = setup_executor().await;
+        let enqueue_patch = executor
+            .execute("b-1", "UTC", &[enqueue_command()])
+            .await
+            .expect("enqueue");
+        let entry_id = enqueue_patch[0].data["entry"]["id"]
+            .as_str()
+            .expect("entry id")
+            .to_string();
+
+        let complete = Command::QueueComplete(QueueCompleteCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: Utc::now(),
+            source: CommandSource::Admin,
+            entry_id: entry_id.clone(),
+            op_id: Uuid::new_v4().to_string(),
+        });
+        executor
+            .execute_admin_command("b-1", "UTC", complete)
+            .await
+            .expect("queue complete");
+
+        let op_id = Uuid::new_v4().to_string();
+        let command = Command::QueueRemove(QueueRemoveCommand {
+            broadcaster_id: "b-1".to_string(),
+            issued_at: Utc::now(),
+            source: CommandSource::Admin,
+            entry_id: entry_id.clone(),
+            reason: QueueRemovalReason::Undo,
+            op_id: op_id.clone(),
+        });
+
+        let result = executor
+            .execute_admin_command("b-1", "UTC", command)
+            .await
+            .expect("queue remove");
+
+        assert_eq!(result.patches.len(), 1);
+        assert_eq!(result.patches[0].kind_str(), "queue.enqueued");
+        assert!(!result.duplicate);
+
+        match result.result {
+            CommandApplyResult::QueueMutation {
+                entry_id: ref reported_entry,
+                mode,
+                user_today_count,
+            } => {
+                assert_eq!(reported_entry, &entry_id);
+                assert_eq!(mode, QueueMutationMode::Undo);
+                assert_eq!(user_today_count, 1);
+            }
+            other => panic!("unexpected result {other:?}"),
+        }
+
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, status_reason, completed_at FROM queue_entries WHERE id = ?",
+        )
+        .bind(&entry_id)
+        .fetch_one(executor.database.pool())
+        .await
+        .expect("fetch entry");
+        assert_eq!(row.0, QueueEntryStatus::Queued.as_str());
+        assert!(row.1.is_none());
+        assert!(row.2.is_none());
+
+        let count: Option<i64> =
+            sqlx::query_scalar("SELECT count FROM daily_counters WHERE user_id = 'u-1'")
+                .fetch_optional(executor.database.pool())
+                .await
+                .expect("fetch counter");
+        assert_eq!(count.unwrap_or(0), 1);
+
+        let duplicate = executor
+            .execute_admin_command(
+                "b-1",
+                "UTC",
+                Command::QueueRemove(QueueRemoveCommand {
+                    broadcaster_id: "b-1".to_string(),
+                    issued_at: Utc::now(),
+                    source: CommandSource::Admin,
+                    entry_id: entry_id.clone(),
+                    reason: QueueRemovalReason::Undo,
+                    op_id,
+                }),
+            )
+            .await
+            .expect("duplicate remove");
+        assert!(duplicate.duplicate);
+        assert!(duplicate.patches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_remove_cancel_decrements_counter() {
         let executor = setup_executor().await;
         let enqueue_patch = executor
             .execute("b-1", "UTC", &[enqueue_command()])
@@ -1600,7 +1851,7 @@ mod tests {
             issued_at: Utc::now(),
             source: CommandSource::Admin,
             entry_id: entry_id.clone(),
-            reason: QueueRemovalReason::Undo,
+            reason: QueueRemovalReason::ExplicitRemove,
             op_id: op_id.clone(),
         });
 
@@ -1627,7 +1878,7 @@ mod tests {
                 user_today_count,
             } => {
                 assert_eq!(reported_entry, &entry_id);
-                assert_eq!(mode, QueueMutationMode::Undo);
+                assert_eq!(mode, QueueMutationMode::Cancel);
                 assert_eq!(user_today_count, 0);
             }
             other => panic!("unexpected result {other:?}"),
@@ -1640,7 +1891,10 @@ mod tests {
                 .await
                 .expect("fetch entry");
         assert_eq!(row.0, QueueEntryStatus::Removed.as_str());
-        assert_eq!(row.1.as_deref(), Some(QueueRemovalReason::Undo.as_str()));
+        assert_eq!(
+            row.1.as_deref(),
+            Some(QueueRemovalReason::ExplicitRemove.as_str())
+        );
 
         let count: Option<i64> =
             sqlx::query_scalar("SELECT count FROM daily_counters WHERE user_id = 'u-1'")
@@ -1658,7 +1912,7 @@ mod tests {
                     issued_at: Utc::now(),
                     source: CommandSource::Admin,
                     entry_id: entry_id.clone(),
-                    reason: QueueRemovalReason::Undo,
+                    reason: QueueRemovalReason::ExplicitRemove,
                     op_id,
                 }),
             )

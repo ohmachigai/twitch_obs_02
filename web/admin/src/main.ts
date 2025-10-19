@@ -4,17 +4,22 @@ import {
   VersionMismatchError,
   type ClientState,
   type Patch,
+  type QueueEntry,
+  type QueueReorderUpdate,
 } from '@twi/shared-state';
 import {
   ApiError,
   createAdminSseConnection,
   fetchState,
   queueDequeue,
+  queueReorder,
   updateSettings,
   type QueueMutationMode,
 } from './api';
 import { parseAdminConfig, type AdminConfig } from './config';
 import { populateSettingsForm, readSettingsPatch } from './settings';
+import { formatRelativeTime } from './time';
+import { buildReorderEntries, computeReorderOrder } from './reorder';
 
 type ConnectionStatus = 'idle' | 'loading' | 'live' | 'reconnecting' | 'error';
 
@@ -28,14 +33,36 @@ let config: AdminConfig | null = null;
 let clientState: ClientState | null = null;
 let eventSource: EventSource | null = null;
 let pendingResync = false;
+let reorderInFlight = false;
+let dragSourceId: string | null = null;
+let dropIndicatorTarget: HTMLLIElement | null = null;
+
+function canReorder(): boolean {
+  return Boolean(clientState && !clientState.settings.prioritize_low_counts);
+}
 
 const statusEl = document.getElementById('connection-status') as HTMLDivElement | null;
 const alertsEl = document.getElementById('alerts') as HTMLDivElement | null;
 const queueListEl = document.getElementById('queue-list') as HTMLUListElement | null;
 const queueEmptyEl = document.getElementById('queue-empty') as HTMLDivElement | null;
+const reorderDisabledEl = document.getElementById('queue-reorder-disabled') as HTMLDivElement | null;
+const completedListEl = document.getElementById('completed-list') as HTMLUListElement | null;
+const completedEmptyEl = document.getElementById('completed-empty') as HTMLDivElement | null;
 const countersTable = document.getElementById('counters-table') as HTMLTableElement | null;
 const countersEmpty = document.getElementById('counters-empty') as HTMLDivElement | null;
 const settingsForm = document.getElementById('settings-form') as HTMLFormElement | null;
+
+const RELATIVE_TIME_INTERVAL_MS = 30_000;
+
+interface RelativeTimeNode {
+  element: HTMLElement;
+  timestamp: Date;
+  absolute: string;
+  label: string;
+}
+
+let relativeTimeNodes: RelativeTimeNode[] = [];
+let relativeTimeTimer: number | null = null;
 
 function setStatus(status: ConnectionStatus, message?: string) {
   if (!statusEl) {
@@ -151,6 +178,7 @@ function renderState() {
     return;
   }
   renderQueue();
+  renderCompleted();
   renderCounters();
   if (settingsForm) {
     populateSettingsForm(settingsForm, clientState.settings);
@@ -163,6 +191,16 @@ function renderQueue() {
   }
 
   queueListEl.innerHTML = '';
+  queueListEl.classList.remove('queue-list--drop-end');
+  dropIndicatorTarget = null;
+  const prioritize = clientState.settings.prioritize_low_counts;
+  if (reorderDisabledEl) {
+    reorderDisabledEl.hidden = !prioritize || clientState.queue.length === 0;
+  }
+  queueListEl.classList.toggle('queue--reorder-disabled', prioritize);
+  if (prioritize) {
+    dragSourceId = null;
+  }
   if (clientState.queue.length === 0) {
     queueEmptyEl.hidden = false;
     return;
@@ -172,6 +210,13 @@ function renderQueue() {
 
   for (const entry of clientState.queue) {
     const item = document.createElement('li');
+    item.className = 'queue-item';
+    item.draggable = !prioritize;
+    item.dataset.entryId = entry.id;
+    if (!prioritize) {
+      item.addEventListener('dragstart', (event) => handleQueueDragStart(event, entry.id));
+      item.addEventListener('dragend', handleQueueDragEnd);
+    }
 
     const header = document.createElement('header');
     const name = document.createElement('div');
@@ -183,12 +228,7 @@ function renderQueue() {
     const metaContainer = document.createElement('div');
     metaContainer.className = 'queue-meta';
     metaContainer.appendChild(meta);
-    const status = document.createElement('span');
-    status.className = entry.managed
-      ? 'queue-status queue-status--managed'
-      : 'queue-status queue-status--manual';
-    status.textContent = entry.managed ? 'Managed' : 'Manual';
-    metaContainer.appendChild(status);
+    metaContainer.appendChild(createStatusBadge(entry));
     header.appendChild(metaContainer);
 
     const actions = document.createElement('div');
@@ -200,20 +240,85 @@ function renderQueue() {
       void handleQueueAction(entry.id, 'COMPLETE', completeButton);
     });
 
-    const undoButton = document.createElement('button');
-    undoButton.textContent = 'Undo';
-    undoButton.classList.add('secondary');
-    undoButton.addEventListener('click', () => {
-      void handleQueueAction(entry.id, 'UNDO', undoButton);
-    });
-
     actions.appendChild(completeButton);
-    actions.appendChild(undoButton);
+    const cancelButton = document.createElement('button');
+    cancelButton.textContent = 'Cancel';
+    cancelButton.classList.add('danger');
+    cancelButton.addEventListener('click', () => {
+      void handleQueueAction(entry.id, 'CANCEL', cancelButton);
+    });
+    actions.appendChild(cancelButton);
 
     item.appendChild(header);
     item.appendChild(actions);
     queueListEl.appendChild(item);
   }
+}
+
+function renderCompleted() {
+  if (!clientState || !completedListEl || !completedEmptyEl) {
+    return;
+  }
+
+  completedListEl.innerHTML = '';
+  relativeTimeNodes = [];
+
+  if (clientState.completed.length === 0) {
+    completedEmptyEl.hidden = false;
+    refreshRelativeTimeTimer();
+    return;
+  }
+
+  completedEmptyEl.hidden = true;
+
+  for (const entry of clientState.completed) {
+    const item = document.createElement('li');
+
+    const header = document.createElement('header');
+    const name = document.createElement('div');
+    name.textContent = entry.user_display_name ?? entry.user_login;
+    header.appendChild(name);
+
+    const metaContainer = document.createElement('div');
+    metaContainer.className = 'queue-meta';
+    const meta = document.createElement('small');
+    meta.className = 'completed-meta';
+    if (entry.completed_at) {
+      const completedAt = new Date(entry.completed_at);
+      const absolute = completedAt.toLocaleString();
+      meta.textContent = `Completed ${absolute} (${formatRelativeTime(completedAt)})`;
+      registerRelativeTime(meta, completedAt, 'Completed', absolute);
+    } else {
+      meta.textContent = 'Completed time unavailable';
+    }
+    metaContainer.appendChild(meta);
+    metaContainer.appendChild(createStatusBadge(entry));
+    header.appendChild(metaContainer);
+
+    const actions = document.createElement('div');
+    actions.className = 'queue-actions';
+
+    const undoButton = document.createElement('button');
+    undoButton.textContent = 'Undo';
+    undoButton.addEventListener('click', () => {
+      void handleQueueAction(entry.id, 'UNDO', undoButton);
+    });
+    actions.appendChild(undoButton);
+
+    const cancelButton = document.createElement('button');
+    cancelButton.textContent = 'Cancel';
+    cancelButton.classList.add('danger');
+    cancelButton.addEventListener('click', () => {
+      void handleQueueAction(entry.id, 'CANCEL', cancelButton);
+    });
+    actions.appendChild(cancelButton);
+
+    item.appendChild(header);
+    item.appendChild(actions);
+    completedListEl.appendChild(item);
+  }
+
+  refreshRelativeTimeTimer();
 }
 
 function renderCounters() {
@@ -244,6 +349,180 @@ function renderCounters() {
     row.appendChild(countCell);
     tbody.appendChild(row);
   }
+}
+
+function registerRelativeTime(
+  element: HTMLElement,
+  timestamp: Date,
+  label: string,
+  absolute: string
+) {
+  relativeTimeNodes.push({ element, timestamp, label, absolute });
+}
+
+function updateRelativeTimeNodes(now = new Date()) {
+  for (const node of relativeTimeNodes) {
+    const relative = formatRelativeTime(node.timestamp, now);
+    node.element.textContent = `${node.label} ${node.absolute} (${relative})`;
+  }
+}
+
+function stopRelativeTimeTimer() {
+  if (relativeTimeTimer !== null) {
+    window.clearInterval(relativeTimeTimer);
+    relativeTimeTimer = null;
+  }
+}
+
+function refreshRelativeTimeTimer() {
+  if (relativeTimeNodes.length === 0) {
+    stopRelativeTimeTimer();
+    return;
+  }
+
+  updateRelativeTimeNodes();
+  if (relativeTimeTimer === null) {
+    relativeTimeTimer = window.setInterval(() => {
+      updateRelativeTimeNodes();
+    }, RELATIVE_TIME_INTERVAL_MS);
+  }
+}
+
+function createStatusBadge(entry: QueueEntry): HTMLSpanElement {
+  const status = document.createElement('span');
+  status.className = entry.managed
+    ? 'queue-status queue-status--managed'
+    : 'queue-status queue-status--manual';
+  status.textContent = entry.managed ? 'Managed' : 'Manual';
+  return status;
+}
+
+function handleQueueDragStart(event: DragEvent, entryId: string) {
+  if (reorderInFlight || !canReorder()) {
+    event.preventDefault();
+    return;
+  }
+  dragSourceId = entryId;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', entryId);
+  }
+  const target = event.currentTarget as HTMLElement | null;
+  target?.classList.add('is-dragging');
+}
+
+function handleQueueDragEnd(event: DragEvent) {
+  const target = event.currentTarget as HTMLElement | null;
+  target?.classList.remove('is-dragging');
+  dragSourceId = null;
+  updateDropIndicator(null);
+  queueListEl?.classList.remove('queue-list--drop-end');
+}
+
+function handleQueueDragOver(event: DragEvent) {
+  if (!dragSourceId || reorderInFlight || !queueListEl || !canReorder()) {
+    return;
+  }
+  event.preventDefault();
+  const afterElement = getDragAfterElement(queueListEl, event.clientY);
+  updateDropIndicator(afterElement);
+}
+
+function handleQueueDrop(event: DragEvent) {
+  if (!dragSourceId || !queueListEl || !clientState || !canReorder()) {
+    return;
+  }
+  event.preventDefault();
+  const afterElement = getDragAfterElement(queueListEl, event.clientY);
+  const beforeId = afterElement?.dataset.entryId ?? null;
+  updateDropIndicator(null);
+  queueListEl.classList.remove('queue-list--drop-end');
+  const currentOrder = clientState.queue.map((entry) => entry.id);
+  const nextOrder = computeReorderOrder(currentOrder, dragSourceId, beforeId);
+  dragSourceId = null;
+  if (!nextOrder) {
+    return;
+  }
+  void submitQueueReorder(nextOrder);
+}
+
+function getDragAfterElement(
+  container: HTMLUListElement,
+  y: number
+): HTMLLIElement | null {
+  const elements = Array.from(
+    container.querySelectorAll<HTMLLIElement>('li.queue-item:not(.is-dragging)')
+  );
+  let closest: { offset: number; element: HTMLLIElement | null } = {
+    offset: Number.NEGATIVE_INFINITY,
+    element: null,
+  };
+  for (const element of elements) {
+    const box = element.getBoundingClientRect();
+    const offset = y - (box.top + box.height / 2);
+    if (offset < 0 && offset > closest.offset) {
+      closest = { offset, element };
+    }
+  }
+  return closest.element;
+}
+
+function updateDropIndicator(target: HTMLLIElement | null) {
+  if (dropIndicatorTarget && dropIndicatorTarget !== target) {
+    dropIndicatorTarget.classList.remove('queue-item--drop-before');
+  }
+  if (target) {
+    target.classList.add('queue-item--drop-before');
+  }
+  dropIndicatorTarget = target;
+  if (queueListEl) {
+    queueListEl.classList.toggle('queue-list--drop-end', !target && dragSourceId !== null);
+  }
+}
+
+async function submitQueueReorder(order: string[]) {
+  if (!config || !clientState || reorderInFlight || !canReorder()) {
+    return;
+  }
+  const updates = buildReorderEntries(order);
+  reorderInFlight = true;
+  try {
+    const opId = crypto.randomUUID();
+    const response = await queueReorder({
+      baseUrl: config.baseUrl,
+      broadcaster: config.broadcaster,
+      token: config.token,
+      entries: updates,
+      opId,
+    });
+    applyOptimisticReorder(order, updates);
+    showAlert('success', `Reorder accepted (version ${response.version}).`);
+  } catch (error) {
+    handleError(error);
+  } finally {
+    reorderInFlight = false;
+  }
+}
+
+function applyOptimisticReorder(order: string[], updates: QueueReorderUpdate[]) {
+  if (!clientState || !canReorder()) {
+    return;
+  }
+  const updateMap = new Map(updates.map((entry) => [entry.entry_id, entry.display_order]));
+  const lookup = new Map(clientState.queue.map((entry) => [entry.id, entry]));
+  const nextQueue: QueueEntry[] = [];
+  for (const id of order) {
+    const existing = lookup.get(id);
+    if (existing) {
+      const displayOrder = updateMap.get(id) ?? existing.display_order;
+      nextQueue.push({ ...existing, display_order: displayOrder });
+    }
+  }
+  clientState = {
+    ...clientState,
+    queue: nextQueue,
+  };
+  renderQueue();
 }
 
 async function handleQueueAction(entryId: string, mode: QueueMutationMode, button: HTMLButtonElement) {
@@ -338,8 +617,14 @@ function init() {
     });
   }
 
+  if (queueListEl) {
+    queueListEl.addEventListener('dragover', handleQueueDragOver);
+    queueListEl.addEventListener('drop', handleQueueDrop);
+  }
+
   window.addEventListener('beforeunload', () => {
     closeSse();
+    stopRelativeTimeTimer();
   });
 
   void loadInitialState();

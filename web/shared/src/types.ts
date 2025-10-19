@@ -10,8 +10,10 @@ export interface QueueEntry {
   reward_id: string;
   redemption_id?: string;
   enqueued_at: string;
+  display_order: number;
   status: QueueEntryStatus;
   status_reason?: string;
+  completed_at?: string;
   managed: boolean;
   last_updated_at: string;
 }
@@ -34,6 +36,7 @@ export interface Settings {
   group_size: number;
   clear_on_stream_start: boolean;
   clear_decrement_counts: boolean;
+  prioritize_low_counts: boolean;
   policy: PolicySettings;
 }
 
@@ -44,6 +47,7 @@ export type SettingsPatch = Partial<Omit<Settings, 'policy'>> & {
 export interface StateSnapshot {
   version: number;
   queue: QueueEntry[];
+  completed: QueueEntry[];
   counters_today: UserCounter[];
   settings: Settings;
 }
@@ -76,7 +80,21 @@ export interface QueueCompletedPatch {
   version: number;
   at: string;
   data: {
-    entry_id: string;
+    entry: QueueEntry;
+  };
+}
+
+export interface QueueReorderUpdate {
+  entry_id: string;
+  display_order: number;
+}
+
+export interface QueueReorderedPatch {
+  type: 'queue.reordered';
+  version: number;
+  at: string;
+  data: {
+    entries: QueueReorderUpdate[];
   };
 }
 
@@ -126,6 +144,7 @@ export type Patch =
   | QueueEnqueuedPatch
   | QueueRemovedPatch
   | QueueCompletedPatch
+  | QueueReorderedPatch
   | CounterUpdatedPatch
   | SettingsUpdatedPatch
   | RedemptionUpdatedPatch

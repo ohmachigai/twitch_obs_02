@@ -168,23 +168,16 @@ match event_type {
 
 ### 2.4 プロジェクタ (`projector.rs`)
 
-`Projector` は `CommandResult` から `Patch` を生成します。
+`Projector` は `Patch::queue_enqueued` / `queue_completed` / `queue_removed` / `queue_reordered` / `counter_updated` などの純粋関数でコマンド結果を SSE パッチへ変換します。
 - **確認ファイル**: `crates/core/src/projector.rs`, `crates/core/src/types.rs`, `web/shared/src/state.ts`
 
-```rust
-// crates/core/src/projector.rs
-pub fn project(result: &CommandResult, now: DateTime<Utc>) -> Vec<Patch> {
-    match result {
-        CommandResult::Enqueued { entry, user_today_count } => vec![Patch::queue_enqueued(now, entry.clone(), *user_today_count)],
-        CommandResult::QueueRemoved { entry_id, reason } => vec![Patch::queue_removed(now, entry_id.clone(), *reason)],
-        CommandResult::CounterUpdated { user_id, count } => vec![Patch::counter_updated(now, user_id.clone(), *count)],
-        CommandResult::SettingsUpdated { patch } => vec![Patch::settings_updated(now, patch.clone())],
-        CommandResult::RedemptionUpdated { redemption_id, managed } => vec![Patch::redemption_updated(now, redemption_id.clone(), *managed)],
-    }
-}
-```
+- `queue_completed`: 完了した `QueueEntry` 全体を埋め込み、完了履歴を UI に伝搬します。
+- `queue_removed`: `entry_id` と `reason`、更新後の `user_today_count` を配信します。`UNDO` と `CANCEL` を識別できるため、カウンタ更新や UI 表示が容易になります。
+- `queue_reordered`: `entries[{entry_id, display_order}]` の配列で手動並び替え結果を通知します。
+- `state.replace`: `queue`・`completed`・`counters_today`・`settings` を含むスナップショットを SSE で再送し、リング欠損時の回復を支援します。
+- `settings.updated`: 管理 UI の設定パッチ（`prioritize_low_counts` など）を伝え、クライアントが並び順を切り替えられるようにします。
 
-`Patch` は `version` と `at` タイムスタンプを持ち、クライアント側のバージョン一致を強制します。
+いずれの `Patch` も `version` と `at` タイムスタンプを持ち、SSE クライアントは `applyPatch` で単調なバージョン整合性をチェックします。
 - **確認ファイル**: `crates/core/src/types.rs`, `web/shared/src/state.ts`
 
 ## 3. 永続層（`crates/storage`）
@@ -214,8 +207,11 @@ EventSub の原本を保持します。
 
 - `insert_entry`: キューを追加し、重複 `redemption_id` を検知。
 - `find_entry_for_update` / `find_entry_by_redemption_for_update`: トランザクション内でレコードをロック。
-- `update_status`: 完了・削除時にステータス・理由・`last_updated_at` を更新。
-- `list_active_with_counts`: 日次カウンタを JOIN して並び替え済みのリストを返却。
+- `list_active_with_counts` / `list_active_with_counts_since`: `prioritize_low_counts` に応じて「日次カウンタ→display_order」または「display_order 単独」で並び替えた待機列を返却。
+- `list_completed_since`: `completed_at` 以降の完了履歴を取得し、管理 UI のグレーアウト表示に利用。
+- `mark_completed` / `restore_from_completed`: 完了・Undo の遷移を担い、`completed_at` と `display_order` を保ったまま状態を変化させる。
+- `mark_removed`: `CANCEL` や配信開始クリアでエントリを `REMOVED` に更新する。
+- `reorder_entries`: 並び替えリクエストを受けて `display_order` を一括更新する。
 - **確認ファイル**: `crates/storage/src/lib.rs` の `QueueRepository`, `.docs/05-data-schema-and-migrations.md`
 
 ### 3.5 `DailyCounterRepository`
@@ -256,7 +252,7 @@ EventSub の原本を保持します。
 
 ### 6.1 共有ライブラリ (`web/shared`)
 
-- `state.ts`: `createClientState` と `applyPatch` がクライアント状態管理の中心。`VersionMismatchError` でバージョン飛びを検出します。
+- `state.ts`: `createClientState` が `queue` と `completed` の 2 リストを生成し、`prioritize_low_counts` が有効な場合は「日次カウンタ → display_order」、無効な場合は「display_order」のみで整列します。`applyPatch` は `queue.completed` で完了リストへ移動し、`queue.reordered` で手動順序を反映し、`settings.updated` で即座に並び替えモードを切り替えます。`VersionMismatchError` でバージョン飛びを検出します。
 - `types.ts`: Rust 側の `twi_overlay_core::types` と構造的に一致する型定義。`Patch` の `type` 文字列は SSE `event` 名に対応。
 - **確認ファイル**: `web/shared/src/state.ts`, `web/shared/src/types.ts`, `web/shared/src/state.test.ts`
 
@@ -270,7 +266,9 @@ EventSub の原本を保持します。
 
 - `api.ts`: 管理操作（キュー消化、設定更新）を REST で呼び出します。
 - `config.ts`: SSE トークンやエンドポイント URL を管理。テストでエラーケースを確認しています。
-- `settings.ts`: React Hook で設定フォームを制御し、`SettingsPatch` を生成します。
+- `settings.ts`: React Hook で設定フォームを制御し、`SettingsPatch` を生成します。`prioritize_low_counts` チェックボックスとドラッグ無効時のガイダンスを担います。
+- `reorder.ts`: 並び替え操作を抽象化し、ドラッグ終了時に `QueueReorderRequest` を構築します。
+- `time.ts`: 完了日時から「何分前」を計算し、履歴リストを自動更新するユーティリティ。
 - **確認ファイル**: `web/admin/src/api.ts`, `web/admin/src/config.ts`, `web/admin/src/config.test.ts`, `web/admin/src/settings.ts`, `web/admin/src/settings.test.ts`, `web/admin/src/main.ts`
 
 ## 7. テスト

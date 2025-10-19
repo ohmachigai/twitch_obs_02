@@ -65,6 +65,7 @@ Settings {
   group_size: number,            // 表示グループの粒度（フロント指標）
   clear_on_stream_start: boolean,
   clear_decrement_counts: boolean, // クリア時に今日の回数を減算するか（既定:false）
+  prioritize_low_counts: boolean,  // 今日の参加回数が少ない順を優先するか（既定:true）
   policy: {
     anti_spam_window_sec: number,     // 例: 60
     duplicate_policy: "consume"|"refund", // 衝突時優先ルール（既定:"consume"）
@@ -135,7 +136,7 @@ CommandLog {
 * `enqueue`（QueueEntry 追加）
 * `counter.increment` / `counter.decrement`
 * `redemption.update`（`refund` or `consume`、Helix 呼出の意図と結果）
-* `queue.complete` / `queue.remove`（COMPLETE/UNDO）
+* `queue.complete` / `queue.remove`（COMPLETE/UNDO/CANCEL）
 * `queue.clear_session_start`（配信開始クリア）
 * `settings.update`
 
@@ -165,14 +166,17 @@ QueueEntry {
   user_avatar: string|null,       // 表示用途
   reward_id: string,
   enqueued_at: string,            // UTC
+  display_order: number,          // 並び替え用の安定キー（REAL）
   status: "QUEUED"|"COMPLETED"|"REMOVED",
   status_reason?: "UNDO"|"STREAM_START_CLEAR"|"EXPLICIT_REMOVE"|string,
+  completed_at?: string|null,     // UTC（完了時のみ値あり）
   managed: boolean,               // Helix 更新が適用されたか（true/false）
   last_updated_at: string         // UTC
 }
 ```
 
-* **表示順**：`ORDER BY today_count ASC, enqueued_at ASC`（**MUST**）。`today_count` は `DailyCounter` を参照。
+* **表示順**：`display_order` を基本キーとして管理し、手動並び替え（`queue.reorder`）で更新される。`prioritize_low_counts=true` の場合は `ORDER BY today_count ASC, display_order ASC` を採用し、手動並び替えは拒否される。`prioritize_low_counts=false` では `ORDER BY display_order ASC` を採用し、ドラッグ操作で更新された順番がそのまま保持される（詳細は `.docs/05`）。
+* **完了履歴**：`status='COMPLETED'` のエントリは `completed_at` を保持したまま待機列とは別に並べ替えて提示する（UI 側で灰色表示・Undo 対応）。
 
 ### 3.8 DailyCounter（“今日の回数”）
 
@@ -186,7 +190,7 @@ DailyCounter {
 }
 ```
 
-* **更新規約**：`enqueue` ⇒ `count++`、`UNDO` ⇒ `count--`、`COMPLETE` ⇒ 変化なし。
+* **更新規約**：`enqueue` ⇒ `count++`、`CANCEL`（`reason="EXPLICIT_REMOVE"`）⇒ `count--`、`COMPLETE`/`UNDO` ⇒ 変化なし。
 * **境界**：`timezone` の 0:00 切替で新 day を開始。
 
 ### 3.9 StreamSession（配信内）
@@ -255,11 +259,14 @@ NormalizedEvent =
 ### 5.3 queue.complete / queue.remove（管理操作）
 
 ```ts
-// COMPLETE: 並び終わり（count 不変）
+// COMPLETE: 並び終わり（完了リストへ移動、count 不変）
 { type: "queue.complete", entry_id, op_id }
 
-// UNDO: 巻き戻し（count--）
+// UNDO: 完了を取り消し、元の並び順でキューへ戻す（count 不変）
 { type: "queue.remove", entry_id, reason: "UNDO", op_id }
+
+// CANCEL: 完全削除（count--）
+{ type: "queue.remove", entry_id, reason: "EXPLICIT_REMOVE", op_id }
 ```
 
 * **規範**：`op_id` 冪等。二重送信は no-op。
@@ -291,7 +298,8 @@ NormalizedEvent =
 ```ts
 { version, type: "queue.enqueued", data: { entry, user_today_count }, at }
 { version, type: "queue.removed",  data: { entry_id, reason, user_today_count }, at }
-{ version, type: "queue.completed",data: { entry_id }, at }
+{ version, type: "queue.completed",data: { entry }, at }
+{ version, type: "queue.reordered", data: { entries: [{ entry_id, display_order }] }, at }
 { version, type: "counter.updated",data: { user_id, count }, at }
 { version, type: "settings.updated", data: { patch }, at }
 { version, type: "stream.online", data:{ session_id }, at }
@@ -302,7 +310,7 @@ NormalizedEvent =
 
 ```ts
 { version, type: "state.replace", data: { state }, at }
-// state = { version, queue:[...], counters_today:[...], settings:{...} }
+// state = { version, queue:[...], completed:[...], counters_today:[...], settings:{...} }
 ```
 
 * **規範**：リング再送の範囲外なら必ず `state.replace` を送る（**SHOULD**）。
@@ -317,10 +325,10 @@ NormalizedEvent =
 4. **QueueEntry 状態遷移**：
 
    * `QUEUED` → `COMPLETED`（COMPLETE）
-   * `QUEUED` → `REMOVED`（UNDO/EXPLICIT/CLEAR）
-   * `COMPLETED`/`REMOVED` → **終端**（**MUST**: 再度 QUEUED に戻さない）
-5. **Counter 更新規約**：`enqueue: +1`、`UNDO: -1`、`COMPLETE: ±0`（**MUST**）。
-6. **表示順**：`ORDER BY today_count ASC, enqueued_at ASC`（**MUST**）。
+   * `COMPLETED` → `QUEUED`（UNDO）
+   * `QUEUED`/`COMPLETED` → `REMOVED`（CANCEL/STREAM_START_CLEAR）
+5. **Counter 更新規約**：`enqueue: +1`、`CANCEL: -1`、`COMPLETE`/`UNDO`: ±0（**MUST**）。
+6. **表示順**：`prioritize_low_counts=true` の場合は `ORDER BY today_count ASC, display_order ASC`、`false` の場合は `ORDER BY display_order ASC`（**MUST**）。
 7. **セッション境界**：`stream.online/offline` で 1 セッション（**MUST**）。
 8. **保持**：`EventRaw`/`CommandLog` は 72h TTL（**MUST**）。`Queue`/`Counter`/`Settings` は永続（**MUST**）。
 9. **決定性**：Normalizer/Policy/Projector は同入力に対して同出力（**MUST**）。Capture/Replay で再現可能（**MUST**）。
@@ -355,10 +363,17 @@ NormalizedEvent =
    * `counter.updated`（同時に送る or `queue.enqueued` に含める）
    * Helix 実行結果は `redemption.update.result` に記録（`ok|failed|skipped`）
 
-### 9.2 Admin COMPLETE／UNDO
+### 9.2 Admin COMPLETE／UNDO／CANCEL
 
 * **COMPLETE**：`queue.complete` → QueueEntry: `COMPLETED`, Counter: 不変 → `queue.completed`
-* **UNDO**：`queue.remove(reason="UNDO")` → QueueEntry: `REMOVED`, Counter: `-1` → `queue.removed` + `counter.updated`
+* **UNDO**：`queue.remove(reason="UNDO")` → QueueEntry: `QUEUED`（`display_order` 維持）, Counter: 不変 → `queue.enqueued`
+* **CANCEL**：`queue.remove(reason="EXPLICIT_REMOVE")` → QueueEntry: `REMOVED`, Counter: `-1` → `queue.removed` + `counter.updated`
+
+### 9.3 Admin REORDER
+
+* **REORDER**：`queue.reorder` → QueueEntry: `display_order` をまとめて更新し、`queue.reordered` パッチで伝搬（`status`・カウンタは不変）。
+* **対象**：`status='QUEUED'` のみ（`COMPLETED`/`REMOVED` は更新不可）。未送信エントリは入力検証で拒否（**MUST**）。
+* **冪等性**：`op_id` で重複を抑止（既存版と同じ）。
 
 ---
 
@@ -397,7 +412,7 @@ NormalizedEvent =
 }
 ```
 
-### 11.2 `queue.removed`（UNDO）
+### 11.2 `queue.removed`（CANCEL）
 
 ```json
 {
@@ -406,7 +421,7 @@ NormalizedEvent =
   "at": "2025-10-12T13:05:00.000Z",
   "data": {
     "entry_id": "01HZX...JK",
-    "reason": "UNDO",
+    "reason": "EXPLICIT_REMOVE",
     "user_today_count": 2
   }
 }

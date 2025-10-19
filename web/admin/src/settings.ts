@@ -27,6 +27,11 @@ export function readSettingsPatch(form: HTMLFormElement): SettingsPatch {
     patch.clear_decrement_counts = clearDecrementCounts;
   }
 
+  const prioritizeLowCounts = (form.elements.namedItem('prioritize_low_counts') as HTMLInputElement | null)?.checked;
+  if (typeof prioritizeLowCounts === 'boolean') {
+    patch.prioritize_low_counts = prioritizeLowCounts;
+  }
+
   const policy: NonNullable<SettingsPatch['policy']> = {};
   const windowRaw = data.get('policy.anti_spam_window_sec');
   if (typeof windowRaw === 'string' && windowRaw.trim().length > 0) {
@@ -68,6 +73,11 @@ export function populateSettingsForm(form: HTMLFormElement, settings: Settings):
   const clearDecrementCounts = form.elements.namedItem('clear_decrement_counts') as HTMLInputElement | null;
   if (clearDecrementCounts) {
     clearDecrementCounts.checked = settings.clear_decrement_counts;
+  }
+
+  const prioritizeLowCounts = form.elements.namedItem('prioritize_low_counts') as HTMLInputElement | null;
+  if (prioritizeLowCounts) {
+    prioritizeLowCounts.checked = settings.prioritize_low_counts;
   }
 
   const windowInput = form.elements.namedItem('policy.anti_spam_window_sec') as HTMLInputElement | null;
