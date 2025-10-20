@@ -17,6 +17,8 @@ pub struct Settings {
     pub clear_on_stream_start: bool,
     #[serde(default)]
     pub clear_decrement_counts: bool,
+    #[serde(default = "default_prioritize_low_counts")]
+    pub prioritize_low_counts: bool,
     #[serde(default)]
     pub policy: PolicySettings,
 }
@@ -35,9 +37,12 @@ pub struct QueueEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redemption_id: Option<String>,
     pub enqueued_at: DateTime<Utc>,
+    pub display_order: f64,
     pub status: QueueEntryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
     pub managed: bool,
     pub last_updated_at: DateTime<Utc>,
 }
@@ -68,6 +73,10 @@ fn default_overlay_theme() -> String {
 
 fn default_group_size() -> u32 {
     1
+}
+
+fn default_prioritize_low_counts() -> bool {
+    true
 }
 
 /// Policy specific settings that control the queue behaviour.
@@ -292,6 +301,7 @@ pub enum Command {
     RedemptionUpdate(RedemptionUpdateCommand),
     QueueComplete(QueueCompleteCommand),
     QueueRemove(QueueRemoveCommand),
+    QueueReorder(QueueReorderCommand),
     SettingsUpdate(SettingsUpdateCommand),
 }
 
@@ -306,6 +316,7 @@ impl Command {
             },
             Self::QueueComplete(_) => "complete",
             Self::QueueRemove(_) => "undo",
+            Self::QueueReorder(_) => "reorder",
             Self::SettingsUpdate(_) => "settings",
         }
     }
@@ -317,6 +328,7 @@ impl Command {
             Self::RedemptionUpdate(command) => command.redacted(),
             Self::QueueComplete(command) => command.redacted(),
             Self::QueueRemove(command) => command.redacted(),
+            Self::QueueReorder(command) => command.redacted(),
             Self::SettingsUpdate(command) => command.redacted(),
         }
     }
@@ -444,6 +456,35 @@ impl QueueRemoveCommand {
     }
 }
 
+/// Queue reorder command emitted by the admin interface.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueueReorderCommand {
+    pub broadcaster_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub source: CommandSource,
+    pub entries: Vec<QueueReorderEntry>,
+    pub op_id: String,
+}
+
+impl QueueReorderCommand {
+    fn redacted(&self) -> Value {
+        json!({
+            "type": "queue.reorder",
+            "broadcaster_id": self.broadcaster_id,
+            "issued_at": self.issued_at,
+            "source": self.source,
+            "entries_len": self.entries.len(),
+        })
+    }
+}
+
+/// Payload describing a new display order for a queue entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueReorderEntry {
+    pub entry_id: String,
+    pub display_order: f64,
+}
+
 /// Reason provided when removing a queue entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -499,6 +540,7 @@ pub enum CommandResult {
 pub struct StateSnapshot {
     pub version: u64,
     pub queue: Vec<QueueEntry>,
+    pub completed: Vec<QueueEntry>,
     pub counters_today: Vec<UserCounter>,
     pub settings: Settings,
 }
@@ -534,6 +576,7 @@ pub enum PatchKind {
     QueueRemoved,
     QueueCompleted,
     CounterUpdated,
+    QueueReordered,
     SettingsUpdated,
     RedemptionUpdated,
     StateReplace,
@@ -546,6 +589,7 @@ impl PatchKind {
             Self::QueueRemoved => "queue.removed",
             Self::QueueCompleted => "queue.completed",
             Self::CounterUpdated => "counter.updated",
+            Self::QueueReordered => "queue.reordered",
             Self::SettingsUpdated => "settings.updated",
             Self::RedemptionUpdated => "redemption.updated",
             Self::StateReplace => "state.replace",
@@ -581,6 +625,7 @@ impl FromStr for PatchKind {
             "queue.removed" => Ok(Self::QueueRemoved),
             "queue.completed" => Ok(Self::QueueCompleted),
             "counter.updated" => Ok(Self::CounterUpdated),
+            "queue.reordered" => Ok(Self::QueueReordered),
             "settings.updated" => Ok(Self::SettingsUpdated),
             "redemption.updated" => Ok(Self::RedemptionUpdated),
             "state.replace" => Ok(Self::StateReplace),

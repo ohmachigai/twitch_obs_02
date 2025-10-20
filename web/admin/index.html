@@ -17,7 +17,13 @@
         <section>
           <h2>Queue</h2>
           <div id="queue-empty" class="muted">Queue is empty.</div>
+          <div id="queue-reorder-disabled" class="muted" hidden>
+            Manual reorder is disabled while prioritizing low participation counts.
+          </div>
           <ul id="queue-list" class="queue"></ul>
+          <h3>Completed</h3>
+          <div id="completed-empty" class="muted">No completed entries.</div>
+          <ul id="completed-list" class="queue queue--completed"></ul>
         </section>
         <section>
           <h2>Counters</h2>
@@ -50,6 +56,10 @@
             <label class="checkbox">
               <input type="checkbox" name="clear_decrement_counts" />
               Decrement counters when clearing
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="prioritize_low_counts" checked />
+              Prioritize viewers with fewer joins today
             </label>
             <fieldset>
               <legend>Policy</legend>

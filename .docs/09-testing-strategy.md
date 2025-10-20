@@ -56,9 +56,9 @@
 * **Projector**：
 
   * `enqueue`→`queue.enqueued` + `counter++`
-  * `queue.remove(reason=UNDO)`→`counter--`
+  * `queue.remove(reason=EXPLICIT_REMOVE)`→`counter--`
   * `queue.complete`→counter 不変
-  * **順序決定**：`today_count ASC, enqueued_at ASC` を **常に満たす**（**MUST**）。
+  * **順序決定**：`prioritize_low_counts=true` では `today_count ASC, display_order ASC`、`false` では `display_order ASC` を **常に満たす**（**MUST**）。
 * **SSE リング**：範囲外で `state.replace` を生成する条件分岐（**MUST**）。
 
 ### 4.2 構造化ログ / Tap / メトリクス
@@ -79,6 +79,7 @@
 
   * 逆順/欠落/重複のパッチは**適用拒否**。
   * `state.replace` は**全置換**。
+* **UI ユーティリティ**：管理 UI の相対時刻計算（`formatRelativeTime`）は閾値境界（59s/60s/61s、23h/24h など）を単体テストで保証（**MUST**）。
 * **テーマトークン**：`theme.json` の `tokens/variants` マージ・`accent` 上書き。
 * **URL パラメータ検証**：`broadcaster` 必須、`group_size` 範囲、`since_version` 正整数。
 
@@ -104,7 +105,8 @@
 ### 6.3 Admin Mutations（`op_id` 冪等）
 
 * COMPLETE：`queue.completed` / counter 不変。
-* UNDO：`queue.removed(reason=UNDO)` / counter 減算。
+* UNDO：`queue.enqueued`
+* CANCEL：`queue.removed(reason=EXPLICIT_REMOVE)` / counter 減算。
 * **同一 `op_id`**：同内容=200、矛盾=412。
 
 ### 6.4 State 初期化（REST→SSE）
@@ -122,7 +124,8 @@
 
   1. 初期 REST → DOM 初期化（Queue/Counters/Settings）
   2. モック `redemption.add` 投入 → `li.queue-item` 追加
-  3. `queue/dequeue(UNDO)` → `li` フェードアウト（`.leave`）→ 削除
+  3. `queue/dequeue(UNDO)` → `li` が完了リストから戻る（灰色解除）
+  4. `queue/dequeue(CANCEL)` → `li` フェードアウト（`.leave`）→ 削除
   4. ページ Reload → **`since_version`** で欠落なく復元
 * **アサーション**：DOM 構造/順序/テキスト、`localStorage("overlay:lastVersion:<b>")` 更新。
 

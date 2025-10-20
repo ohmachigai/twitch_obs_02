@@ -7,7 +7,9 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use twi_overlay_core::types::{QueueEntry, QueueEntryStatus, QueueRemovalReason, Settings};
+use twi_overlay_core::types::{
+    QueueEntry, QueueEntryStatus, QueueRemovalReason, QueueReorderEntry, Settings,
+};
 
 use serde_json::{self, to_string};
 
@@ -542,8 +544,8 @@ impl QueueRepository {
         let managed = if entry.managed { 1 } else { 0 };
         sqlx::query(
             "INSERT INTO queue_entries \
-             (id, broadcaster_id, user_id, user_login, user_display_name, user_avatar, reward_id, redemption_id, enqueued_at, status, status_reason, managed, last_updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, broadcaster_id, user_id, user_login, user_display_name, user_avatar, reward_id, redemption_id, enqueued_at, display_order, status, status_reason, completed_at, managed, last_updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.id)
         .bind(entry.broadcaster_id)
@@ -554,8 +556,10 @@ impl QueueRepository {
         .bind(entry.reward_id)
         .bind(&entry.redemption_id)
         .bind(to_rfc3339(entry.enqueued_at))
+        .bind(entry.display_order)
         .bind(entry.status.as_str())
         .bind(&entry.status_reason)
+        .bind(entry.completed_at.map(to_rfc3339))
         .bind(managed)
         .bind(to_rfc3339(entry.last_updated_at))
         .execute(&mut **tx)
@@ -574,14 +578,16 @@ impl QueueRepository {
         Ok(())
     }
 
-    /// Lists the active queue entries ordered by daily count and enqueue timestamp.
+    /// Lists the active queue entries ordered by daily count and display order.
     pub async fn list_active_with_counts(
         &self,
         broadcaster_id: &str,
         day: &str,
+        prioritize_low_counts: bool,
     ) -> Result<Vec<QueueEntryWithCount>, QueueError> {
-        let rows = sqlx::query_as::<_, QueueEntryWithCount>(
-            r#"
+        let rows = if prioritize_low_counts {
+            sqlx::query_as::<_, QueueEntryWithCount>(
+                r#"
 SELECT q.id,
        q.broadcaster_id,
        q.user_id,
@@ -591,25 +597,61 @@ SELECT q.id,
        q.reward_id,
        q.redemption_id,
        q.enqueued_at as "enqueued_at: DateTime<Utc>",
+       q.display_order,
        q.status,
        q.status_reason,
+       q.completed_at as "completed_at: DateTime<Utc>",
        q.managed,
        q.last_updated_at as "last_updated_at: DateTime<Utc>",
        COALESCE(dc.count, 0) as "today_count"
   FROM queue_entries AS q
-  LEFT JOIN daily_counters AS dc
+ LEFT JOIN daily_counters AS dc
     ON dc.day = ?
    AND dc.broadcaster_id = q.broadcaster_id
    AND dc.user_id = q.user_id
  WHERE q.broadcaster_id = ?
    AND q.status = 'QUEUED'
- ORDER BY today_count ASC, q.enqueued_at ASC
-            "#,
-        )
-        .bind(day)
-        .bind(broadcaster_id)
-        .fetch_all(&self.pool)
-        .await?;
+ORDER BY today_count ASC, q.display_order ASC
+                "#,
+            )
+            .bind(day)
+            .bind(broadcaster_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, QueueEntryWithCount>(
+                r#"
+SELECT q.id,
+       q.broadcaster_id,
+       q.user_id,
+       q.user_login,
+       q.user_display_name,
+       q.user_avatar,
+       q.reward_id,
+       q.redemption_id,
+       q.enqueued_at as "enqueued_at: DateTime<Utc>",
+       q.display_order,
+       q.status,
+       q.status_reason,
+       q.completed_at as "completed_at: DateTime<Utc>",
+       q.managed,
+       q.last_updated_at as "last_updated_at: DateTime<Utc>",
+       COALESCE(dc.count, 0) as "today_count"
+  FROM queue_entries AS q
+ LEFT JOIN daily_counters AS dc
+    ON dc.day = ?
+   AND dc.broadcaster_id = q.broadcaster_id
+   AND dc.user_id = q.user_id
+ WHERE q.broadcaster_id = ?
+   AND q.status = 'QUEUED'
+ ORDER BY q.display_order ASC
+                "#,
+            )
+            .bind(day)
+            .bind(broadcaster_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         Ok(rows)
     }
@@ -619,9 +661,11 @@ SELECT q.id,
         broadcaster_id: &str,
         day: &str,
         since: DateTime<Utc>,
+        prioritize_low_counts: bool,
     ) -> Result<Vec<QueueEntryWithCount>, QueueError> {
-        let rows = sqlx::query_as::<_, QueueEntryWithCount>(
-            r#"
+        let rows = if prioritize_low_counts {
+            sqlx::query_as::<_, QueueEntryWithCount>(
+                r#"
 SELECT q.id,
        q.broadcaster_id,
        q.user_id,
@@ -631,29 +675,106 @@ SELECT q.id,
        q.reward_id,
        q.redemption_id,
        q.enqueued_at as "enqueued_at: DateTime<Utc>",
+       q.display_order,
        q.status,
        q.status_reason,
+       q.completed_at as "completed_at: DateTime<Utc>",
        q.managed,
        q.last_updated_at as "last_updated_at: DateTime<Utc>",
        COALESCE(dc.count, 0) as "today_count"
   FROM queue_entries AS q
-  LEFT JOIN daily_counters AS dc
+ LEFT JOIN daily_counters AS dc
     ON dc.day = ?
    AND dc.broadcaster_id = q.broadcaster_id
    AND dc.user_id = q.user_id
  WHERE q.broadcaster_id = ?
    AND q.status = 'QUEUED'
    AND q.last_updated_at >= ?
- ORDER BY today_count ASC, q.enqueued_at ASC
+ORDER BY today_count ASC, q.display_order ASC
+                "#,
+            )
+            .bind(day)
+            .bind(broadcaster_id)
+            .bind(to_rfc3339(since))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, QueueEntryWithCount>(
+                r#"
+SELECT q.id,
+       q.broadcaster_id,
+       q.user_id,
+       q.user_login,
+       q.user_display_name,
+       q.user_avatar,
+       q.reward_id,
+       q.redemption_id,
+       q.enqueued_at as "enqueued_at: DateTime<Utc>",
+       q.display_order,
+       q.status,
+       q.status_reason,
+       q.completed_at as "completed_at: DateTime<Utc>",
+       q.managed,
+       q.last_updated_at as "last_updated_at: DateTime<Utc>",
+       COALESCE(dc.count, 0) as "today_count"
+  FROM queue_entries AS q
+ LEFT JOIN daily_counters AS dc
+    ON dc.day = ?
+   AND dc.broadcaster_id = q.broadcaster_id
+   AND dc.user_id = q.user_id
+ WHERE q.broadcaster_id = ?
+   AND q.status = 'QUEUED'
+   AND q.last_updated_at >= ?
+ ORDER BY q.display_order ASC
+                "#,
+            )
+            .bind(day)
+            .bind(broadcaster_id)
+            .bind(to_rfc3339(since))
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows)
+    }
+
+    /// Lists completed queue entries updated since the provided timestamp.
+    pub async fn list_completed_since(
+        &self,
+        broadcaster_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<QueueEntry>, QueueError> {
+        let rows = sqlx::query_as::<_, QueueEntryRow>(
+            r#"
+SELECT id,
+       broadcaster_id,
+       user_id,
+       user_login,
+       user_display_name,
+       user_avatar,
+       reward_id,
+       redemption_id,
+       enqueued_at as "enqueued_at: DateTime<Utc>",
+       display_order,
+       status,
+       status_reason,
+       completed_at as "completed_at: DateTime<Utc>",
+       managed,
+       last_updated_at as "last_updated_at: DateTime<Utc>"
+  FROM queue_entries
+ WHERE broadcaster_id = ?
+   AND status = 'COMPLETED'
+   AND completed_at IS NOT NULL
+   AND completed_at >= ?
+ ORDER BY completed_at DESC, display_order ASC
             "#,
         )
-        .bind(day)
         .bind(broadcaster_id)
         .bind(to_rfc3339(since))
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows)
+        Ok(rows.into_iter().map(QueueEntryRow::into_domain).collect())
     }
 
     /// Finds a queue entry within an ongoing transaction.
@@ -674,8 +795,10 @@ SELECT id,
        reward_id,
        redemption_id,
        enqueued_at as "enqueued_at: DateTime<Utc>",
+       display_order,
        status,
        status_reason,
+       completed_at as "completed_at: DateTime<Utc>",
        managed,
        last_updated_at as "last_updated_at: DateTime<Utc>"
   FROM queue_entries
@@ -709,8 +832,10 @@ SELECT id,
        reward_id,
        redemption_id,
        enqueued_at as "enqueued_at: DateTime<Utc>",
+       display_order,
        status,
        status_reason,
+       completed_at as "completed_at: DateTime<Utc>",
        managed,
        last_updated_at as "last_updated_at: DateTime<Utc>"
   FROM queue_entries
@@ -751,6 +876,7 @@ SELECT id,
 UPDATE queue_entries
    SET status = 'COMPLETED',
        status_reason = NULL,
+       completed_at = ?,
        last_updated_at = ?
  WHERE broadcaster_id = ?
    AND id = ?
@@ -763,12 +889,15 @@ UPDATE queue_entries
            reward_id,
            redemption_id,
            enqueued_at as "enqueued_at: DateTime<Utc>",
+           display_order,
            status,
            status_reason,
+           completed_at as "completed_at: DateTime<Utc>",
            managed,
            last_updated_at as "last_updated_at: DateTime<Utc>"
             "#,
         )
+        .bind(to_rfc3339(updated_at))
         .bind(to_rfc3339(updated_at))
         .bind(broadcaster_id)
         .bind(entry_id)
@@ -795,7 +924,7 @@ UPDATE queue_entries
             return Err(QueueError::NotFound);
         };
 
-        if entry.status != QueueEntryStatus::Queued {
+        if entry.status == QueueEntryStatus::Removed {
             return Err(QueueError::InvalidTransition(entry.status));
         }
 
@@ -804,6 +933,7 @@ UPDATE queue_entries
 UPDATE queue_entries
    SET status = 'REMOVED',
        status_reason = ?,
+       completed_at = NULL,
        last_updated_at = ?
  WHERE broadcaster_id = ?
    AND id = ?
@@ -816,8 +946,10 @@ UPDATE queue_entries
            reward_id,
            redemption_id,
            enqueued_at as "enqueued_at: DateTime<Utc>",
+           display_order,
            status,
            status_reason,
+           completed_at as "completed_at: DateTime<Utc>",
            managed,
            last_updated_at as "last_updated_at: DateTime<Utc>"
             "#,
@@ -830,6 +962,117 @@ UPDATE queue_entries
         .await?;
 
         Ok(row.into_domain())
+    }
+
+    /// Restores a completed entry back to the queued state.
+    pub async fn restore_from_completed(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        broadcaster_id: &str,
+        entry_id: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<QueueEntry, QueueError> {
+        let existing = self
+            .find_entry_for_update(tx, broadcaster_id, entry_id)
+            .await?;
+
+        let Some(entry) = existing else {
+            return Err(QueueError::NotFound);
+        };
+
+        if entry.status != QueueEntryStatus::Completed {
+            return Err(QueueError::InvalidTransition(entry.status));
+        }
+
+        let row = sqlx::query_as::<_, QueueEntryRow>(
+            r#"
+UPDATE queue_entries
+   SET status = 'QUEUED',
+       status_reason = NULL,
+       completed_at = NULL,
+       last_updated_at = ?
+ WHERE broadcaster_id = ?
+   AND id = ?
+RETURNING id,
+          broadcaster_id,
+          user_id,
+          user_login,
+          user_display_name,
+          user_avatar,
+          reward_id,
+          redemption_id,
+          enqueued_at as "enqueued_at: DateTime<Utc>",
+          display_order,
+          status,
+          status_reason,
+          completed_at as "completed_at: DateTime<Utc>",
+          managed,
+          last_updated_at as "last_updated_at: DateTime<Utc>"
+            "#,
+        )
+        .bind(to_rfc3339(updated_at))
+        .bind(broadcaster_id)
+        .bind(entry_id)
+        .fetch_one(&mut **tx)
+        .await?;
+
+        Ok(row.into_domain())
+    }
+
+    /// Updates the display order for queued entries.
+    pub async fn reorder_entries(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        broadcaster_id: &str,
+        updates: &[QueueReorderEntry],
+        updated_at: DateTime<Utc>,
+    ) -> Result<Vec<QueueReorderEntry>, QueueError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for update in updates {
+            let Some(entry) = self
+                .find_entry_for_update(tx, broadcaster_id, &update.entry_id)
+                .await?
+            else {
+                return Err(QueueError::NotFound);
+            };
+
+            if entry.status != QueueEntryStatus::Queued {
+                return Err(QueueError::InvalidTransition(entry.status));
+            }
+        }
+
+        let mut applied = Vec::with_capacity(updates.len());
+        for update in updates {
+            let result = sqlx::query(
+                r#"
+UPDATE queue_entries
+   SET display_order = ?,
+       last_updated_at = ?
+ WHERE broadcaster_id = ?
+   AND id = ?
+                "#,
+            )
+            .bind(update.display_order)
+            .bind(to_rfc3339(updated_at))
+            .bind(broadcaster_id)
+            .bind(&update.entry_id)
+            .execute(&mut **tx)
+            .await?;
+
+            if result.rows_affected() != 1 {
+                return Err(QueueError::NotFound);
+            }
+
+            applied.push(QueueReorderEntry {
+                entry_id: update.entry_id.clone(),
+                display_order: update.display_order,
+            });
+        }
+
+        Ok(applied)
     }
 
     /// Updates the managed flag for a queue entry, returning the refreshed representation.
@@ -857,8 +1100,10 @@ UPDATE queue_entries
            reward_id,
            redemption_id,
            enqueued_at as "enqueued_at: DateTime<Utc>",
+           display_order,
            status,
            status_reason,
+           completed_at as "completed_at: DateTime<Utc>",
            managed,
            last_updated_at as "last_updated_at: DateTime<Utc>"
             "#,
@@ -889,8 +1134,10 @@ pub struct NewQueueEntry<'a> {
     pub reward_id: &'a str,
     pub redemption_id: Option<String>,
     pub enqueued_at: DateTime<Utc>,
+    pub display_order: f64,
     pub status: QueueEntryStatus,
     pub status_reason: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
     pub managed: bool,
     pub last_updated_at: DateTime<Utc>,
 }
@@ -908,8 +1155,11 @@ pub struct QueueEntryWithCount {
     pub redemption_id: Option<String>,
     #[sqlx(rename = "enqueued_at: DateTime<Utc>")]
     pub enqueued_at: DateTime<Utc>,
+    pub display_order: f64,
     pub status: String,
     pub status_reason: Option<String>,
+    #[sqlx(rename = "completed_at: DateTime<Utc>")]
+    pub completed_at: Option<DateTime<Utc>>,
     pub managed: i64,
     #[sqlx(rename = "last_updated_at: DateTime<Utc>")]
     pub last_updated_at: DateTime<Utc>,
@@ -931,8 +1181,10 @@ impl QueueEntryWithCount {
                 reward_id: self.reward_id,
                 redemption_id: self.redemption_id,
                 enqueued_at: self.enqueued_at,
+                display_order: self.display_order,
                 status,
                 status_reason: self.status_reason,
+                completed_at: self.completed_at,
                 managed: self.managed != 0,
                 last_updated_at: self.last_updated_at,
             },
@@ -2561,8 +2813,10 @@ mod tests {
             reward_id: "reward-1",
             redemption_id: Some("red-1".into()),
             enqueued_at: now,
+            display_order: 1.0,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: true,
             last_updated_at: now,
         };
@@ -2580,11 +2834,19 @@ mod tests {
             .expect("mark completed");
         assert_eq!(updated.status, QueueEntryStatus::Completed);
         assert!(updated.status_reason.is_none());
+        assert!(updated.completed_at.is_some());
         tx.commit().await.expect("commit update");
+
+        let completed = queue_repo
+            .list_completed_since("b-1", now - ChronoDuration::minutes(5))
+            .await
+            .expect("list completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, "q-1");
     }
 
     #[tokio::test]
-    async fn queue_mark_removed_sets_reason() {
+    async fn queue_mark_removed_sets_reason_for_cancel() {
         let db = setup_db().await;
         let queue_repo = db.queue();
         let command_repo = db.command_log();
@@ -2600,8 +2862,10 @@ mod tests {
             reward_id: "reward-1",
             redemption_id: Some("red-2".into()),
             enqueued_at: now,
+            display_order: 2.0,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: false,
             last_updated_at: now,
         };
@@ -2614,12 +2878,360 @@ mod tests {
         let command_repo = db.command_log();
         let mut tx = command_repo.begin().await.expect("begin update");
         let updated = queue_repo
-            .mark_removed(&mut tx, "b-1", "q-2", QueueRemovalReason::Undo, Utc::now())
+            .mark_removed(
+                &mut tx,
+                "b-1",
+                "q-2",
+                QueueRemovalReason::ExplicitRemove,
+                Utc::now(),
+            )
             .await
             .expect("mark removed");
         assert_eq!(updated.status, QueueEntryStatus::Removed);
-        assert_eq!(updated.status_reason.as_deref(), Some("UNDO"));
+        assert_eq!(updated.status_reason.as_deref(), Some("EXPLICIT_REMOVE"));
+        assert!(updated.completed_at.is_none());
         tx.commit().await.expect("commit update");
+    }
+
+    #[tokio::test]
+    async fn queue_restore_from_completed_transitions_entry() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let new_entry = NewQueueEntry {
+            id: "q-restore".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-restore",
+            user_login: "restore".into(),
+            user_display_name: "Restore".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-restore".into()),
+            enqueued_at: now,
+            display_order: 5.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &new_entry)
+            .await
+            .expect("insert entry");
+        tx.commit().await.expect("commit");
+
+        let mut tx = command_repo.begin().await.expect("begin complete");
+        queue_repo
+            .mark_completed(&mut tx, "b-1", "q-restore", now)
+            .await
+            .expect("complete");
+        tx.commit().await.expect("commit complete");
+
+        let mut tx = command_repo.begin().await.expect("begin restore");
+        let restored = queue_repo
+            .restore_from_completed(&mut tx, "b-1", "q-restore", now)
+            .await
+            .expect("restore");
+        assert_eq!(restored.status, QueueEntryStatus::Queued);
+        assert!(restored.completed_at.is_none());
+        tx.commit().await.expect("commit restore");
+    }
+
+    #[tokio::test]
+    async fn list_active_with_counts_respects_prioritize_flag() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let counter_repo = db.daily_counters();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin queue seed");
+        let now = Utc::now();
+        let entry_a = NewQueueEntry {
+            id: "q-a".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-a",
+            user_login: "alice".into(),
+            user_display_name: "Alice".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-a".into()),
+            enqueued_at: now,
+            display_order: 1.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        let entry_b = NewQueueEntry {
+            id: "q-b".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-b",
+            user_login: "bob".into(),
+            user_display_name: "Bob".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-b".into()),
+            enqueued_at: now,
+            display_order: 2.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &entry_a)
+            .await
+            .expect("insert a");
+        queue_repo
+            .insert_entry(&mut tx, &entry_b)
+            .await
+            .expect("insert b");
+        tx.commit().await.expect("seed commit");
+
+        let mut tx = command_repo.begin().await.expect("begin counter seed");
+        counter_repo
+            .increment(
+                &mut tx,
+                &NewDailyCounter {
+                    day: "2024-01-01".into(),
+                    broadcaster_id: "b-1",
+                    user_id: "user-a",
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("increment user-a first");
+        counter_repo
+            .increment(
+                &mut tx,
+                &NewDailyCounter {
+                    day: "2024-01-01".into(),
+                    broadcaster_id: "b-1",
+                    user_id: "user-a",
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("increment user-a second");
+        tx.commit().await.expect("counter commit");
+
+        let prioritized = queue_repo
+            .list_active_with_counts("b-1", "2024-01-01", true)
+            .await
+            .expect("prioritized query");
+        let prioritized_ids: Vec<String> = prioritized
+            .into_iter()
+            .map(|row| row.into_domain().0.id)
+            .collect();
+        assert_eq!(prioritized_ids, vec!["q-b", "q-a"]);
+
+        let manual = queue_repo
+            .list_active_with_counts("b-1", "2024-01-01", false)
+            .await
+            .expect("manual query");
+        let manual_ids: Vec<String> = manual
+            .into_iter()
+            .map(|row| row.into_domain().0.id)
+            .collect();
+        assert_eq!(manual_ids, vec!["q-a", "q-b"]);
+    }
+
+    #[tokio::test]
+    async fn queue_reorder_updates_display_order() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let entry_a = NewQueueEntry {
+            id: "q-a".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-a",
+            user_login: "alice".into(),
+            user_display_name: "Alice".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-a".into()),
+            enqueued_at: now,
+            display_order: 1.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        let entry_b = NewQueueEntry {
+            id: "q-b".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-b",
+            user_login: "bob".into(),
+            user_display_name: "Bob".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-b".into()),
+            enqueued_at: now,
+            display_order: 2.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &entry_a)
+            .await
+            .expect("insert a");
+        queue_repo
+            .insert_entry(&mut tx, &entry_b)
+            .await
+            .expect("insert b");
+        tx.commit().await.expect("seed commit");
+
+        let mut tx = command_repo.begin().await.expect("begin reorder");
+        let updates = vec![
+            QueueReorderEntry {
+                entry_id: "q-a".into(),
+                display_order: 3.0,
+            },
+            QueueReorderEntry {
+                entry_id: "q-b".into(),
+                display_order: 1.5,
+            },
+        ];
+        let applied = queue_repo
+            .reorder_entries(&mut tx, "b-1", &updates, now)
+            .await
+            .expect("reorder");
+        assert_eq!(applied, updates);
+
+        let reordered_a = queue_repo
+            .find_entry_for_update(&mut tx, "b-1", "q-a")
+            .await
+            .expect("find a")
+            .expect("entry a");
+        assert_eq!(reordered_a.display_order, 3.0);
+        let reordered_b = queue_repo
+            .find_entry_for_update(&mut tx, "b-1", "q-b")
+            .await
+            .expect("find b")
+            .expect("entry b");
+        assert_eq!(reordered_b.display_order, 1.5);
+        tx.commit().await.expect("commit reorder");
+    }
+
+    #[tokio::test]
+    async fn queue_reorder_rejects_non_queued_entries() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let entry = NewQueueEntry {
+            id: "q-complete".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-c",
+            user_login: "carol".into(),
+            user_display_name: "Carol".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-c".into()),
+            enqueued_at: now,
+            display_order: 4.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &entry)
+            .await
+            .expect("insert entry");
+        tx.commit().await.expect("seed commit");
+
+        let mut tx = command_repo.begin().await.expect("begin complete");
+        queue_repo
+            .mark_completed(&mut tx, "b-1", "q-complete", now)
+            .await
+            .expect("complete");
+        tx.commit().await.expect("commit complete");
+
+        let mut tx = command_repo.begin().await.expect("begin reorder");
+        let result = queue_repo
+            .reorder_entries(
+                &mut tx,
+                "b-1",
+                &[QueueReorderEntry {
+                    entry_id: "q-complete".into(),
+                    display_order: 10.0,
+                }],
+                now,
+            )
+            .await;
+        match result {
+            Err(QueueError::InvalidTransition(status)) => {
+                assert_eq!(status, QueueEntryStatus::Completed);
+            }
+            other => panic!("expected invalid transition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_mark_removed_allows_completed_entries() {
+        let db = setup_db().await;
+        let queue_repo = db.queue();
+        let command_repo = db.command_log();
+        let mut tx = command_repo.begin().await.expect("begin");
+        let now = Utc::now();
+        let entry = NewQueueEntry {
+            id: "q-completed".into(),
+            broadcaster_id: "b-1",
+            user_id: "user-completed",
+            user_login: "done".into(),
+            user_display_name: "Done".into(),
+            user_avatar: None,
+            reward_id: "reward-1",
+            redemption_id: Some("red-done".into()),
+            enqueued_at: now,
+            display_order: 6.0,
+            status: QueueEntryStatus::Queued,
+            status_reason: None,
+            completed_at: None,
+            managed: false,
+            last_updated_at: now,
+        };
+        queue_repo
+            .insert_entry(&mut tx, &entry)
+            .await
+            .expect("insert entry");
+        tx.commit().await.expect("commit");
+
+        let mut tx = command_repo.begin().await.expect("begin complete");
+        queue_repo
+            .mark_completed(&mut tx, "b-1", "q-completed", now)
+            .await
+            .expect("complete");
+        tx.commit().await.expect("commit complete");
+
+        let mut tx = command_repo.begin().await.expect("begin remove");
+        let removed = queue_repo
+            .mark_removed(
+                &mut tx,
+                "b-1",
+                "q-completed",
+                QueueRemovalReason::ExplicitRemove,
+                now,
+            )
+            .await
+            .expect("remove");
+        assert_eq!(removed.status, QueueEntryStatus::Removed);
+        assert_eq!(removed.status_reason.as_deref(), Some("EXPLICIT_REMOVE"));
+        assert!(removed.completed_at.is_none());
+        tx.commit().await.expect("commit remove");
     }
 
     #[tokio::test]
@@ -2652,8 +3264,10 @@ mod tests {
             reward_id: "reward-1",
             redemption_id: Some("red-3".into()),
             enqueued_at: now,
+            display_order: 3.0,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: false,
             last_updated_at: now,
         };
@@ -2700,8 +3314,10 @@ mod tests {
             reward_id: "reward-lookup",
             redemption_id: Some("red-lookup".into()),
             enqueued_at: now,
+            display_order: 4.0,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: false,
             last_updated_at: now,
         };
@@ -2736,8 +3352,10 @@ mod tests {
             reward_id: "reward-flag",
             redemption_id: Some("red-flag".into()),
             enqueued_at: now,
+            display_order: 5.0,
             status: QueueEntryStatus::Queued,
             status_reason: None,
+            completed_at: None,
             managed: false,
             last_updated_at: now,
         };
@@ -2853,8 +3471,11 @@ struct QueueEntryRow {
     redemption_id: Option<String>,
     #[sqlx(rename = "enqueued_at: DateTime<Utc>")]
     enqueued_at: DateTime<Utc>,
+    display_order: f64,
     status: String,
     status_reason: Option<String>,
+    #[sqlx(rename = "completed_at: DateTime<Utc>")]
+    completed_at: Option<DateTime<Utc>>,
     managed: i64,
     #[sqlx(rename = "last_updated_at: DateTime<Utc>")]
     last_updated_at: DateTime<Utc>,
@@ -2872,8 +3493,10 @@ impl QueueEntryRow {
             reward_id: self.reward_id,
             redemption_id: self.redemption_id,
             enqueued_at: self.enqueued_at,
+            display_order: self.display_order,
             status: map_status(&self.status),
             status_reason: self.status_reason,
+            completed_at: self.completed_at,
             managed: self.managed != 0,
             last_updated_at: self.last_updated_at,
         }

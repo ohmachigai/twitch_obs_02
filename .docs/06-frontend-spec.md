@@ -156,13 +156,14 @@ web/overlay/themes/<theme_name>/
 ```ts
 interface ClientState {
   version: number;                     // lastAppliedVersion
-  queue: Map<entry_id, QueueItem>;     // 表示中アイテム（QUEUED）
+  queue: Map<entry_id, QueueItem>;     // 表示中アイテム（status=QUEUED）
+  completed: Map<entry_id, QueueItem>; // 完了履歴（status=COMPLETED）
   counters: Map<user_id, number>;      // 今日の回数
   settings: Settings;                  // 表示に影響
 }
 ```
 
-* **順序**：表示は常に `today_count ASC, enqueued_at ASC` を遵守（サーバ順を維持、必要なら再ソート）。
+* **順序**：キュー表示は `today_count ASC, display_order ASC` を遵守。完了履歴は `completed_at DESC, display_order ASC` が既定。
 * **永続**：`version` は `localStorage("overlay:lastVersion:<b>")` に保存（MUST）。他は揮発。
 
 ### 7.2 パッチ適用規約（MUST）
@@ -173,9 +174,9 @@ interface ClientState {
 
 * **型別適用**：
 
-  * `queue.enqueued`：`queue` へ挿入、`counters[user] = data.user_today_count` を同期。
-  * `queue.removed`：該当 `entry` を削除、`counters[user]` を `data.user_today_count` に同期。
-  * `queue.completed`：該当 `entry` を削除（`counter` は変更なし）。
+  * `queue.enqueued`：`queue` へ挿入、`completed` から除去、`counters[user] = data.user_today_count` を同期。
+  * `queue.removed`：該当 `entry` を `queue`/`completed` から削除、`counters[user]` を `data.user_today_count` に同期。
+  * `queue.completed`：`queue` から除去し、`completed` へ追加（`counter` は変更なし）。
   * `counter.updated`：`counters[user] = count`。
   * `settings.updated`：`settings` をマージ、必要なら UI 再レンダ。
   * `stream.online/offline`：HUD に反映（任意、**状態計算は Projector に従う**）。
@@ -227,29 +228,26 @@ interface ClientState {
 
 ---
 
-## 13. 管理 UI（最小仕様）
+## 13. 管理 UI（待機列 + 完了履歴）
 
-* **目的**：手動操作（COMPLETE/UNDO / Settings 更新）と**可視化**（イベント・現在キュー）。
+* **目的**：管理者が **現在の待機列**を操作し、**完了履歴**を確認・復元できること。
+* **画面構成**：`/admin/index.html?broadcaster=...` を Vite で配信し、以下の 3 カラム（レスポンシブ時は縦積み）で構成する。
 
-* **構成**：
+1. **Queue セクション**：`state.queue` を設定フラグに従って描画（`prioritize_low_counts=true` のときは `today_count ASC, display_order ASC`、`false` のときは `display_order ASC`）。
+   * 各行は `user_display_name`／`Enqueued <local time>`／Managed バッジを表示。
+   * `prioritize_low_counts=false` のときのみ行要素を `draggable=true` とし、HTML5 Drag & Drop で再配置できるようにする。`dragover` ではマウス位置から挿入先を計算し、対象行に `queue-item--drop-before` / `queue-item--drop-after` を付与して視覚フィードバックを出す。
+   * `prioritize_low_counts=true` のときは並び替え UI を無効化し、「今日の参加回数優先モードでは手動並び替え不可」であることを `muted` テキストで表示する。
+   * `drop` 時はローカルで再計算した順序から `entries[{ entry_id, display_order }]` を生成し、`op_id=UUIDv4` とともに `/api/queue/reorder` へ POST する。レスポンスの `version` を toast で通知し、SSE が届くまで暫定的にローカル状態を更新して体験を損なわない。`prioritize_low_counts=true` のときは API 自体が 409 を返すためリクエストを発行しない（MUST）。
+   * アクションは **Complete**（`mode="COMPLETE"`）と **Cancel**（`mode="CANCEL"`）。ボタン押下時は `op_id=UUIDv4` を生成して `/api/queue/dequeue` へ POST し、結果を toast で通知する。
+  2. **Completed セクション**：`state.completed` を `completed_at DESC, display_order ASC` で描画。
+     * アイテムは灰色トーンで表示（`queue-item--completed` などのクラスで背景/文字色を弱める）。
+     * メタ情報として **絶対時刻**（`toLocaleString()`）と **相対時刻**（`formatRelativeTime()`）を同時に描画する。相対表示は 30 秒ごとに再計算し、`completed_at` が存在しない場合は “Completed time unavailable” と明示する。
+     * アクションは **Undo**（`mode="UNDO"`。元の `display_order` に復元）と **Cancel**（`mode="CANCEL"`。履歴からも削除）。
+  3. **Counters / Settings セクション**：従来どおり `state.counters_today` と `state.settings` を表示し、Settings フォームは `updateSettings()` で PATCH を送信する。
 
-  * `GET /admin/index.html?broadcaster=...`
-  * 左：**操作パネル**（フォーム）
-
-    * COMPLETE：`entry_id` 入力 → `POST /api/queue/dequeue { mode:"COMPLETE", op_id }`
-    * UNDO：同（`mode:"UNDO"`）
-    * Settings 更新：`patch` JSON 入力 → `POST /api/settings/update`
-  * 右：**ビュー**
-
-    * `GET /api/state` の内容（queue/counters/settings）
-    * `GET /admin/sse` のパッチ反映
-
-* **要件**：
-
-  * `op_id` はクライアントで UUID 生成（MUST）。
-  * 送信前に**簡易バリデーション**（`entry_id` 形式など）
-  * 応答・エラーを **toast** 表示。
-  * フレームワークは htmx + 少量 JS で実装（自由だが**契約は固定**）。
+* **SSE / 状態反映**：`@twi/shared-state` の `ClientState` を唯一の真実とし、`applyPatch()` 適用後に `renderQueue()` / `renderCompleted()` / `renderCounters()` を呼び出す。`queue.completed` パッチは完了リストに移動、`queue.removed` は待機列・完了履歴の双方から削除する（MUST）。`queue.reordered` は `display_order` を更新し、現在の設定に応じて並び順を再計算する（`prioritize_low_counts=false` では手動順序をそのまま保持）。
+* **アクセシビリティ / フィードバック**：接続状態（Idle/Loading/Live/Error）をヘッダ右側に表示し、操作ボタンは送信中に `disabled` へ遷移させる。トーストは `aria-live="polite"` な領域に append する。
+* **相対時刻ヘルパー**：`formatRelativeTime(target, base)` をユーティリティとして共通化し、Vitest で単体テストを追加する（MUST）。ブラウザ側では `setInterval(30s)` で再計算し、タブ非表示時でもズレを最小化する。
 
 ---
 
@@ -286,7 +284,7 @@ interface ClientState {
 * [ ] パッチ適用：厳密増分（`state.version + 1`）規約、`state.replace` フォールバック
 * [ ] グループ化は**表現のみ**（データ構造を変更しない）
 * [ ] デバッグ HUD（`debug=1|tap`）、コンソールに機微情報を出さない
-* [ ] 管理 UI：COMPLETE/UNDO/Settings、`op_id` 冪等、SSE 反映
+* [ ] 管理 UI：COMPLETE/UNDO/CANCEL/Settings、`op_id` 冪等、SSE 反映
 * [ ] アクセシビリティ（`prefers-reduced-motion`、代替テキスト、aria）
 * [ ] パフォーマンス（1フレームバッチ、lazy 画像、transform/opacity）
 
@@ -299,8 +297,9 @@ interface ClientState {
 | `queue.enqueued`        | 末尾に `li` 追加 → 再ソート（`today_count, enqueued_at`） → `.enter` アニメ |
 | `queue.removed`         | 対象 `li` をフェードアウト `.leave` → `animationend` で削除                |
 | `queue.completed`       | 同上（理由は UI では区別しなくてよい／テーマで色分け可）                                |
-| `counter.updated`       | 対象ユーザの `meta` を即時更新、並び順再評価                                    |
-| `settings.updated`      | `group_size` やテーマ適用値を再計算、必要なら DOM 再構成                         |
+| `queue.reordered`       | 対象エントリの `display_order` を更新し、現在の設定に従って並び順を再計算                          |
+| `counter.updated`       | 対象ユーザの `meta` を即時更新、`prioritize_low_counts=true` のときのみ並び順再評価 |
+| `settings.updated`      | `group_size` やテーマ適用値を再計算、必要なら DOM 再構成。`prioritize_low_counts` 変更時は並び替え UI の有効/無効を即時反映 |
 | `state.replace`         | `queue/counters/settings` 全置換、`version` 更新、DOM リビルド           |
 | `stream.online/offline` | HUD 表示（セッション境界の通知、任意）                                         |
 

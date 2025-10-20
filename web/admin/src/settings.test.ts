@@ -10,6 +10,7 @@ describe('settings helpers', () => {
         <input type="text" name="overlay_theme" value="midnight" />
         <input type="checkbox" name="clear_on_stream_start" checked />
         <input type="checkbox" name="clear_decrement_counts" />
+        <input type="checkbox" name="prioritize_low_counts" checked />
         <input type="number" name="policy.anti_spam_window_sec" value="120" />
         <select name="policy.duplicate_policy">
           <option value="consume">Consume</option>
@@ -24,6 +25,7 @@ describe('settings helpers', () => {
     expect(patch.overlay_theme).toBe('midnight');
     expect(patch.clear_on_stream_start).toBe(true);
     expect(patch.clear_decrement_counts).toBe(false);
+    expect(patch.prioritize_low_counts).toBe(true);
     expect(patch.policy?.anti_spam_window_sec).toBe(120);
     expect(patch.policy?.duplicate_policy).toBe('refund');
   });
@@ -35,6 +37,7 @@ describe('settings helpers', () => {
         <input type="text" name="overlay_theme" />
         <input type="checkbox" name="clear_on_stream_start" />
         <input type="checkbox" name="clear_decrement_counts" />
+        <input type="checkbox" name="prioritize_low_counts" />
         <input type="number" name="policy.anti_spam_window_sec" />
         <select name="policy.duplicate_policy">
           <option value="consume">Consume</option>
@@ -49,6 +52,7 @@ describe('settings helpers', () => {
       group_size: 2,
       clear_on_stream_start: true,
       clear_decrement_counts: true,
+      prioritize_low_counts: true,
       policy: {
         anti_spam_window_sec: 90,
         duplicate_policy: 'consume',
@@ -62,6 +66,7 @@ describe('settings helpers', () => {
     expect((form.elements.namedItem('overlay_theme') as HTMLInputElement).value).toBe('default');
     expect((form.elements.namedItem('clear_on_stream_start') as HTMLInputElement).checked).toBe(true);
     expect((form.elements.namedItem('clear_decrement_counts') as HTMLInputElement).checked).toBe(true);
+    expect((form.elements.namedItem('prioritize_low_counts') as HTMLInputElement).checked).toBe(true);
     expect((form.elements.namedItem('policy.anti_spam_window_sec') as HTMLInputElement).value).toBe('90');
     expect((form.elements.namedItem('policy.duplicate_policy') as HTMLSelectElement).value).toBe('consume');
   });

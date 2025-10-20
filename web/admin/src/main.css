@@ -45,6 +45,16 @@ header {
   gap: 0.5rem;
 }
 
+.queue--completed li {
+  background: rgba(31, 41, 55, 0.6);
+  border: 1px solid rgba(156, 163, 175, 0.25);
+  opacity: 0.7;
+}
+
+.queue--completed li:hover {
+  opacity: 0.8;
+}
+
 .queue li header {
   display: flex;
   align-items: center;
@@ -94,6 +104,10 @@ button {
 
 button.secondary {
   background: #6b7280;
+}
+
+button.danger {
+  background: #dc2626;
 }
 
 button:disabled {
@@ -185,4 +199,43 @@ select {
 .queue-status--manual {
   background: rgba(249, 115, 22, 0.2);
   color: #fbbf24;
+}
+
+.queue-item {
+  position: relative;
+  cursor: grab;
+  transition: background-color 0.2s ease;
+}
+
+#queue-list.queue--reorder-disabled .queue-item {
+  cursor: default;
+}
+
+#queue-list.queue--reorder-disabled .queue-item:active {
+  cursor: default;
+}
+
+.queue-item.is-dragging {
+  opacity: 0.6;
+}
+
+.queue-item--drop-before::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  border-top: 2px solid rgba(59, 130, 246, 0.8);
+}
+
+#queue-list.queue-list--drop-end::after {
+  content: '';
+  display: block;
+  border-top: 2px solid rgba(59, 130, 246, 0.8);
+  margin: 0.25rem 0;
+}
+
+.completed-meta {
+  color: #d1d5db;
+  font-size: 0.875rem;
 }

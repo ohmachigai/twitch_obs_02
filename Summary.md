@@ -8,3 +8,4 @@
 * [拡張とカスタマイズの指針](memo/06_extensions_and_customization.md)
 * [トラブルシューティング & FAQ](memo/07_troubleshooting_and_faq.md)
 * [付録](memo/08_appendix.md)
+* [キュー管理機能の総合解説と検証手順](memo/09_queue_management_and_verification.md)

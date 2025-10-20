@@ -237,6 +237,30 @@ CREATE TABLE helix_backfill_checkpoints (
 );
 ```
 
+### 4.5 `0005_queue_completion_history.sql` — display_order / completed_at 拡張
+
+```sql
+ALTER TABLE queue_entries ADD COLUMN display_order REAL NOT NULL DEFAULT 0;
+ALTER TABLE queue_entries ADD COLUMN completed_at TEXT; -- UTC, NULL = 未完了
+
+-- 既存行の display_order を enqueued_at 由来の epoch 秒に初期化
+UPDATE queue_entries
+   SET display_order = (julianday(enqueued_at) - 2440587.5) * 86400.0
+ WHERE display_order = 0;
+
+-- 過去に完了済みの行には last_updated_at を completed_at として引き継ぐ
+UPDATE queue_entries
+   SET completed_at = last_updated_at
+ WHERE status = 'COMPLETED' AND completed_at IS NULL;
+
+CREATE INDEX ix_queue_broadcaster_status_display
+  ON queue_entries(broadcaster_id, status, display_order);
+CREATE INDEX ix_queue_broadcaster_status_completed
+  ON queue_entries(broadcaster_id, status, completed_at DESC);
+```
+
+* **display_order 運用**：`queue.reorder` コマンドは対象行の `display_order` と `last_updated_at` を一括更新する。未指定の行は既存値を維持し、Undo 後も元の `display_order` で復元される（**MUST**）。
+
 > `oauth_login_states` は **短寿命 TTL（既定 10 分）でクリーンアップ**。`helix_backfill_checkpoints.status` は Backfill ワーカーの状態（`idle`／`running`／`error`）を示し、`error_message` で最新の Helix 応答を残す。`cursor` / `last_redemption_id` / `last_seen_at` は Helix UNFULFILLED 再取得の再開ポイントであり、ワーカーは `running` → `idle|error` の順で更新する。。
 
 ---
@@ -285,7 +309,9 @@ SELECT q.*, COALESCE(dc.count, 0) AS today_count
    AND dc.user_id = q.user_id
  WHERE q.broadcaster_id = :b
    AND q.status = 'QUEUED'
- ORDER BY today_count ASC, q.enqueued_at ASC;
+ ORDER BY
+    CASE WHEN :prioritize_low_counts THEN today_count END ASC,
+    q.display_order ASC;
 ```
 
 ---

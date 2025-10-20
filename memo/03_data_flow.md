@@ -85,7 +85,7 @@ Command::Enqueue(enqueue) => {
 ## 4. コマンドログと SSE への変換
 
 1. **コマンドログ**: 各コマンドは `NewCommandLog` として `command_log` テーブルに保存され、`version` が単調増加します。SSE の `Last-Event-ID` と同期させるための基準です（関連コード: `crates/app/src/command.rs`, `crates/storage/src/lib.rs` の `CommandLogRepository`）。
-2. **プロジェクタ (`Projector`)**: コマンドの適用結果を `Projector::new` が `Patch` に変換します。例として、`QueueCompleteCommand` は `queue.completed` パッチを生成し、削除対象エントリ ID を含みます（関連コード: `crates/core/src/projector.rs`, `crates/core/src/types.rs`）。
+2. **プロジェクタ (`Projector`)**: `Projector::queue_completed` / `queue_removed` などのヘルパ関数で `Patch` を組み立てます。`queue.completed` は完了したエントリ全体（`QueueEntry` 構造体）を埋め込み、`queue.removed` は `reason` と更新後の `user_today_count` を含みます（関連コード: `crates/core/src/projector.rs`, `crates/core/src/types.rs`）。
 3. **SSE ブロードキャスト**: `SseHub::broadcast_patch` はキューリングバッファにパッチを保存し、接続中のクライアントに即座に送信します。送信に成功すると `emit_sse_stage` が Tap に記録します（関連コード: `crates/app/src/sse.rs`, `crates/app/src/tap.rs`）。
 
 ```rust
@@ -111,7 +111,7 @@ Ok(patches) => {
 
 1. **トークン検証**: `state_snapshot` ハンドラは `SseTokenValidator::validate_any` でベアラートークンを検証し、オーディエンス（`Overlay` or `Admin`）とブロードキャスタ ID が一致するか確認します（関連コード: `crates/app/src/state.rs`, `crates/app/src/sse.rs` の `SseTokenValidator`）。
 2. **スコープ制限**: `parse_state_scope` ヘルパーが `scope` クエリ（`session` or `since`）と `since` タイムスタンプを検証し、`StateScope` を構築します。`scope=since` の場合は RFC 3339 形式の時刻が必須で、バリデーションを通過すると `state_index` を参照して差分のみを返します（関連コード: `crates/app/src/router.rs` の `parse_state_scope`, `crates/app/src/state.rs`, `crates/storage/src/lib.rs` の `StateIndexRepository`）。
-3. **レスポンス構築**: `build_state_snapshot` は `QueueRepository::list_active_with_counts`、`DailyCounterRepository::list_today`、`BroadcasterRepository::fetch_settings` からデータを集約し、`StateSnapshot` 構造体に詰めます（関連コード: `crates/app/src/state.rs`, `crates/storage/src/lib.rs`）。
+3. **レスポンス構築**: `build_state_snapshot` は `QueueRepository::list_active_with_counts`（待機列）と `QueueRepository::list_completed_since`（完了履歴）を読み出し、`prioritize_low_counts` の値に応じて並び順を切り替えながら `DailyCounterRepository::list_today` と `BroadcasterRepository::fetch_settings` の結果を束ねて `StateSnapshot`（`queue` / `completed` / `counters_today` / `settings`）を構築します（関連コード: `crates/app/src/state.rs`, `crates/storage/src/lib.rs`）。
 
 ```rust
 // crates/app/src/state.rs
@@ -133,14 +133,14 @@ pub async fn build_state_snapshot(
 1. **クエリパラメータ**: `SseQuery` は `broadcaster`, `token`, `types`, `since_version` を受け取ります。`types` により `queue.*` や `settings.updated` など特定パッチのみ購読できます（関連コード: `crates/app/src/sse.rs`）。
 2. **リングバッファ再送**: `since_version` または `Last-Event-ID` が指定されると、`SseHub::subscribe` がリングバッファをフィルタリングして該当バージョンより新しいメッセージだけを `Subscription::backlog` に積み直します。バッファが不足していた場合（`ring_miss`）は `AppState::sse().build_state_replace` が呼ばれ、最新スナップショットを SSE で再送します（関連コード: `crates/app/src/sse.rs`, `crates/app/src/router.rs`）。
 3. **心拍**: Axum の `Sse::keep_alive` で `axum::response::sse::KeepAlive::new().interval(Duration::from_secs(state.sse_heartbeat()))` が設定され、`state.sse_heartbeat()` 秒ごとに `heartbeat` コメントが送信されます。`.docs/02` で定義された 20–30 秒心拍要件に対応しています（関連コード: `crates/app/src/router.rs`, `.docs/02-architecture-overview.md`）。
-4. **クライアント適用**: フロントエンドは `web/shared/src/state.ts` の `applyPatch` で受信した `Patch` をクライアント状態に適用し、React コンポーネントは `useEffect` 内で再レンダリングします（関連コード: `web/shared/src/state.ts`, `web/overlay/src/App.tsx`, `web/admin/src/main.ts`）。
+4. **クライアント適用**: フロントエンドは `web/shared/src/state.ts` の `applyPatch` で `queue`・`completed` の両リストを更新します。`queue.completed` 受信時は完了項目が履歴へ移動し、`queue.reordered` 受信時は `display_order` を再評価します。`settings.updated` で `prioritize_low_counts` が変化すると並び順が即座に切り替わり、React 側（`web/overlay/src/App.tsx`, `web/admin/src/main.ts`）は `useEffect` で再描画します。
 
 ## 6. 管理操作のフロー
 
 ### 6.1 キュー消化 `/api/queue/dequeue`
 
-1. **入力**: `QueueDequeueRequest` は `entry_id`, `mode` (`COMPLETE` or `UNDO`), `op_id` を受け取ります（関連コード: `crates/app/src/router.rs` の ルート定義, `crates/app/src/command.rs` の `QueueDequeueRequest`, `.docs/04-api-contracts.md`）。
-2. **コマンド生成**: `CommandExecutor::execute_dequeue`（`queue_dequeue` ハンドラ内）が `Command::QueueComplete` または `Command::QueueRemove` を生成します（関連コード: `crates/app/src/command.rs` の `execute_dequeue`, `crates/core/src/types.rs` の `Command`）。
+1. **入力**: `QueueDequeueRequest` は `entry_id`, `mode` (`COMPLETE` / `UNDO` / `CANCEL`), `op_id` を受け取ります（関連コード: `crates/app/src/router.rs` のルート定義, `crates/app/src/command.rs` の `QueueDequeueRequest`, `.docs/04-api-contracts.md`）。
+2. **コマンド生成**: `CommandExecutor::execute_dequeue`（`queue_dequeue` ハンドラ内）が `Command::QueueComplete`（COMPLETE）または `Command::QueueRemove`（UNDO/CANCEL）を生成し、UNDO では `display_order` と `completed_at` を復元し、CANCEL では `QueueRemovalReason::ExplicitRemove` を指定します（関連コード: `crates/app/src/command.rs` の `execute_dequeue`, `crates/core/src/types.rs` の `Command`）。
 3. **レスポンス**: 結果のバージョンと、ユーザの日次カウンタ（`user_today_count`）が返されます。フロントはレスポンスに含まれるパッチと SSE を突き合わせて整合性を確認します（関連コード: `crates/app/src/command.rs` の `QueueDequeueResponse`, `web/admin/src/api.ts`）。
 
 ### 6.2 設定更新 `/api/settings/update`
@@ -148,6 +148,12 @@ pub async fn build_state_snapshot(
 1. **入力**: `SettingsUpdateRequest` は JSON パッチ（部分更新）と `op_id` を送ります（関連コード: `crates/app/src/router.rs` の `/api/settings/update` ルート, `crates/app/src/command.rs` の `SettingsUpdateRequest`, `.docs/04-api-contracts.md`）。
 2. **適用**: `Command::SettingsUpdate` が生成され、`CommandExecutor::handle_settings_update` が `BroadcasterRepository::apply_settings_patch` を経由して永続化します（関連コード: `crates/app/src/command.rs` の `handle_settings_update`, `crates/storage/src/lib.rs` の `BroadcasterRepository`）。
 3. **結果**: `applied: bool` により変更が適用されたかを示し、同一 `op_id` 再送時は `false` が返ります（関連コード: `crates/app/src/command.rs` の `SettingsUpdateResultBody`, `web/admin/src/settings.ts`）。
+
+### 6.3 並び替え `/api/queue/reorder`
+
+1. **入力**: `QueueReorderRequest` は `entries[]`（`entry_id` と新しい `display_order`）と `op_id` を受け取り、手動順序をクライアントからサーバへ反映します（関連コード: `crates/app/src/router.rs`, `web/admin/src/reorder.ts`, `.docs/04-api-contracts.md`）。
+2. **検証**: サーバ側では `prioritize_low_counts` が `true` の場合 `409 reorder_disabled` を返し、リスト内に重複 ID や存在しない ID が含まれると `422` を返します（関連コード: `crates/app/src/router.rs` の `queue_reorder`, `crates/storage/src/lib.rs` の `QueueRepository::apply_manual_ordering`）。
+3. **副作用**: `QueueRepository::update_display_order_batch` が `display_order` を一括更新し、SSE で `queue.reordered` パッチが配信されます。`applyPatch` は受信後に `display_order` 順へ並び直し、管理 UI とオーバーレイの双方で即座に反映されます（関連コード: `crates/core/src/projector.rs`, `web/shared/src/state.ts`, `web/overlay/src/App.tsx`, `web/admin/src/main.ts`）。
 
 ## 7. OAuth と Helix バックフィル
 
@@ -180,8 +186,8 @@ pub async fn build_state_snapshot(
 ## 10. フロントエンドでのデータ適用
 
 1. **初期ロード**: `web/overlay/src/api.ts` の `fetchState` が `/api/state` を呼び出し、`StateSnapshot` を取得します（関連コード: `web/overlay/src/api.ts`, `.docs/04-api-contracts.md`）。
-2. **状態生成**: `createClientState` がスナップショットを `ClientState` へ変換し、`queue` をユーザの日次カウンタと `enqueued_at` の昇順で整列します（関連コード: `web/shared/src/state.ts` の `createClientState`）。
-3. **差分適用**: `applyPatch` が SSE で流れてきた `Patch` を検証し、バージョンが飛んだ場合は `VersionMismatchError` を投げて再同期を促します（関連コード: `web/shared/src/state.ts` の `applyPatch`, `web/shared/src/types.ts`）。
+2. **状態生成**: `createClientState` がスナップショットを `ClientState` へ変換し、`prioritize_low_counts` が `true` の場合は「今日の参加回数 → `display_order`」、`false` の場合は「`display_order` 単独」で `queue` を整列します（関連コード: `web/shared/src/state.ts` の `createClientState`）。
+3. **差分適用**: `applyPatch` が SSE で流れてきた `Patch` を検証し、`queue.completed` で完了リストへ移動、`queue.reordered` で並び替え、`settings.updated` で優先度設定が変わった際は即座に再ソートします。バージョンが飛んだ場合は `VersionMismatchError` を投げて再同期を促します（関連コード: `web/shared/src/state.ts` の `applyPatch`, `web/shared/src/types.ts`）。
 4. **UI 更新**: React コンポーネントは `useState` で保持している状態を更新し、Tailwind 風クラスでキュー一覧やカウンタ、設定を描画します（関連コード: `web/overlay/src/App.tsx`, `web/overlay/src/main.tsx`, `web/overlay/src/App.css`）。
 
 このように、EventSub の受信からクライアントの描画まで、一連の処理は `NormalizedEvent → Command → Patch` のパイプラインに沿って厳密に管理されています。`.docs/` に定義されたインバリアント（冪等性、SSE バージョン管理、多テナント境界など）は、ここで紹介したコード上のチェックやテーブル設計により担保されています。
